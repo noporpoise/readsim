@@ -7,6 +7,7 @@
 #include <strings.h>
 #include <math.h>
 #include <zlib.h>
+#include <time.h>
 
 #include "seq_file.h"
 
@@ -24,7 +25,7 @@ static const char usage[] =
 "  -1 <in.1.fq> input reads\n"
 "  -2 <in.2.fq> input reads\n";
 
-// Sample a random number from normal distribution with [mean 0, variance 1]
+// Sample a random number from normal distribution with [mean 0, stddev 1]
 // From Heng Li
 // http://en.wikipedia.org/wiki/Box_Muller_transform#Polar_form
 // http://en.wikipedia.org/wiki/Marsaglia_polar_method
@@ -166,8 +167,37 @@ size_t generate_qprob(const char *path,
   return len;
 }
 
-// given base c and random i (0 <= i <= 3)
-char mut(char c, int i)
+static inline char dna_complement(char c)
+{
+  switch(c) {
+    case 'a': return 't';
+    case 'c': return 'g';
+    case 'g': return 'c';
+    case 't': return 'a';
+    case 'A': return 'T';
+    case 'C': return 'G';
+    case 'G': return 'C';
+    case 'T': return 'A';
+    default: die("Invalid base: '%c'", c);
+  }
+  die("Invalid base: '%c'", c);
+}
+
+static void dna_revcmp(char *dna, size_t len)
+{
+  if(len == 0) return;
+  if(len == 1) { dna[0] = dna_complement(dna[0]); return; }
+  size_t i, j;
+  char tmp;
+  for(i = 0, j = len-1; i <= j; i++, j--) {
+    tmp = dna[i];
+    dna[i] = dna_complement(dna[j]);
+    dna[j] = dna_complement(tmp);
+  }
+}
+
+// given base c and random i (0 <= i < 3)
+static inline char mut(char c, int i)
 {
   const char bases[] = "ACGTACGT";
   int b;
@@ -229,9 +259,10 @@ size_t rand_chrom(read_t *chroms, size_t nchroms, size_t totallen)
   die("Shouldn't reach here");
 }
 
-void sim_reads(const char *refpath, gzFile out0, gzFile out1, long double *qprob,
-               size_t *mcounts, size_t errlen, size_t tlen,
-               size_t tlen_std_dev, size_t rlen, double depth)
+// Returns ref genome size
+size_t sim_reads(const char *refpath, gzFile out0, gzFile out1, long double *qprob,
+                 size_t *mcounts, size_t errlen, size_t tlen,
+                 size_t tlen_stddev, size_t rlen, double depth)
 {
   seq_file_t *file;
   size_t i, rcap, nchroms, glen = 0, nreads, chr, pos0, pos1;
@@ -260,54 +291,69 @@ void sim_reads(const char *refpath, gzFile out0, gzFile out1, long double *qprob
   char read0[rlen+1], read1[rlen+1];
   read0[rlen] = read1[rlen] = '\0';
 
+  printf("Sampling %zu read pairs\n", nreads);
+
   for(i = 0; i < nreads; i++)
   {
     chr = (nchroms == 1) ? 0 : rand_chrom(r, nchroms, glen);
-    pos0 = rand() * ((double)(r[chr].seq.end-tlen) / RAND_MAX);
-    pos1 = pos0 + tlen + ran_normal()*tlen_std_dev - rlen;
+    pos0 = drand48() * (r[chr].seq.end - tlen);
+    pos1 = pos0 + tlen + ran_normal()*tlen_stddev - rlen;
     if(pos1 + rlen > r[chr].seq.end) pos1 = r[chr].seq.end-rlen;
     memcpy(read0, r[chr].seq.b+pos0, rlen);
     memcpy(read1, r[chr].seq.b+pos1, rlen);
     add_seq_error(read0, rlen, qprob, mcounts, errlen);
     add_seq_error(read1, rlen, qprob, mcounts, errlen);
-    gzprintf(out0, ">r%zu:%s:%zu:%zu\n.*s\n", i, (int)rlen, read0,
-             r[chr].seq.b, pos0, pos1);
-    gzprintf(out1, ">r%zu:%s:%zu:%zu\n.*s\n", i, (int)rlen, read1,
-             r[chr].seq.b, pos0, pos1);
+    dna_revcmp(read1, rlen);
+    gzprintf(out0, ">r%zu:0:%s:%zu:%zu\n%.*s\n", i, r[chr].name.b, pos0, pos1, (int)rlen, read0);
+    gzprintf(out1, ">r%zu:1:%s:%zu:%zu\n%.*s\n", i, r[chr].name.b, pos0, pos1, (int)rlen, read1);
   }
 
   seq_close(file);
 
   for(i = 0; i < nchroms; i++) seq_read_dealloc(&r[i]);
   free(r);
+
+  return glen;
 }
 
 int main(int argc, char **argv)
 {
+  // int k;
+  // double d = ran_normal()*5;
+  // printf("%f", d);
+  // for(k = 1; k < 5000; k++) {
+  //   d = ran_normal()*5;
+  //   printf(",%f", d);
+  // }
+  // printf("\n");
+  // exit(-1);
+
   if(argc < 4) print_usage(usage, NULL);
+  srand(time(NULL) + getpid());
 
   // Sample reads from ref
   char *refpath = NULL;
-  int tlen = 800, tlen_std_dev = 100, rlen = 250;
+  int tlen = 800, tlen_stddev = 100, rlen = 250;
   double depth = 1;
   int optr = 0, optt = 0, optv = 0, optl = 0, optd = 0; // keeps track of values
 
   char *input0 = NULL, *input1 = NULL;
 
   int c;
-  while((c = getopt(argc, argv, "r:t:l:d:1:2:")) >= 0) {
+  while((c = getopt(argc, argv, "r:t:v:l:d:1:2:")) >= 0) {
     switch (c) {
       case 'r': refpath = optarg; optr++; break;
       case 't': tlen = atoi(optarg); optt++; break;
-      case 'v': tlen_std_dev = atoi(optarg); optv++; break;
+      case 'v': tlen_stddev = atoi(optarg); optv++; break;
       case 'l': rlen = atoi(optarg); optl++; break;
       case 'd': depth = atol(optarg); optd++; break;
       case '1': input0 = optarg; break;
       case '2': input1 = optarg; break;
+      default: die("Unknown option: %c", c);
     }
   }
 
-  if(argc - optind < 3) print_usage(usage, NULL);
+  if(argc - optind != 3) print_usage(usage, "Missing args");
 
   if((optt > 0 || optv > 0 || optl > 0 || optd > 0) && refpath == NULL)
     print_usage(usage, "Missing -r <in.fa>");
@@ -319,15 +365,23 @@ int main(int argc, char **argv)
     print_usage(usage, "Need both -1 <in> -2 <in>");
 
   char *out0path = argv[optind+1], *out1path = argv[optind+2];  
-  gzFile out0, out1;
+  gzFile out0 = NULL, out1 = NULL;
 
   if(input0 != NULL)
   {
+    printf("Reading from %s and %s\n", input0, input1);
     if(!test_file_readable(input0)) die("Cannot read: %s", input0);
     if(!test_file_readable(input1)) die("Cannot read: %s", input1);
   }
 
-  if(refpath != NULL) {
+  if(refpath != NULL)
+  {
+    printf("Sampling from %s\n", refpath);
+    printf(" read length: %i\n", rlen);
+    printf(" template length: %i\n", tlen);
+    printf(" template stddev: %i\n", tlen_stddev);
+    printf(" sequencing depth: %f\n", depth);
+    if(!test_file_readable(refpath)) die("Cannot read: %s", refpath);
     if((out0 = gzopen(out0path, "w")) == NULL) die("Cannot open: %s", out0path);
     if((out1 = gzopen(out1path, "w")) == NULL) die("Cannot open: %s", out1path);
   }
@@ -336,7 +390,7 @@ int main(int argc, char **argv)
 
   // qprob[i] is the probability of making a seqn error at base i
   long double *qprob, sumprob;
-  size_t i, errlen, *counts, sumcount;
+  size_t i, errlen, *counts, sumcount, glen;
 
   errlen = generate_qprob(argv[optind], &qprob, &counts);
 
@@ -367,8 +421,8 @@ int main(int argc, char **argv)
   }
 
   if(refpath != NULL) {
-    sim_reads(refpath, out0, out1, qprob, counts, errlen,
-              tlen, tlen_std_dev, rlen, depth);
+    glen = sim_reads(refpath, out0, out1, qprob, counts, errlen,
+                     tlen, tlen_stddev, rlen, depth);
   }
 
   if(out0 != NULL) {
@@ -381,7 +435,8 @@ int main(int argc, char **argv)
       printf(",%zu", counts[i]);
       sumcount += counts[i];
     }
-    printf("\nSeqErrSum: %zu SeqErrMean: %f\n", sumcount, (double)sumcount / errlen);
+    printf("\nSeqErrSum: %zu SeqErrMean: %f\n",
+           sumcount, (double)sumcount / (glen*depth));
   }
 
   free(qprob);
