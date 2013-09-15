@@ -1,4 +1,10 @@
-HTSLIB=~/bioinf/htslib/htslib
+ifdef HTSLIB
+	HTSARGS=-I $(HTSLIB)/htslib -L $(HTSLIB)/htslib -D_USESAM=1
+	LIBS=-lhts -lz -lm
+else
+	HTSARGS=
+	LIBS=-lz -lm
+endif
 
 ifdef DEBUG
 	OPT=-O0 -g -ggdb -DDEBUG=1
@@ -7,7 +13,7 @@ else
 endif
 
 readsim: readsim.c seq_file.h stream_buffer.h
-	$(CC) -Wall -Wextra $(OPT) -o readsim -I $(HTSLIB) -L $(HTSLIB) -D_USESAM=1 readsim.c -lhts -lz -lm
+	$(CC) -Wall -Wextra $(OPT) -o readsim $(HTSARGS) readsim.c $(LIBS)
 
 plot: data/PhiX.1K.1.pdf
 
