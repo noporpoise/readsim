@@ -14,7 +14,7 @@
 static const char usage[] =
 "usage: readsim [options] <out_base>\n"
 " Simulate single base change sequencing errors. \n"
-" Writes to <out_base>.1.fq.gz <out_base>.1.fq.gz\n"
+" Writes to <out_base>.1.fa.gz <out_base>.1.fa.gz\n"
 "\n"
 " Apply Error:\n"
 "  -p <profile.fq> apply errors with distribution as seen in profile.fq\n"
@@ -462,15 +462,15 @@ int main(int argc, char **argv)
     if((profile_sf[i] = seq_open(profile_paths[i])) == NULL)
       die("Cannot open file: %s", profile_paths[i]);
 
-  size_t outlen = strlen(outbase), extlen = strlen(".1.fq.gz");
+  size_t outlen = strlen(outbase), extlen = strlen(".1.fa.gz");
   char out0path[outlen+extlen+1], out1path[outlen+extlen+1];
   memcpy(out0path, outbase, outlen);
   memcpy(out1path, outbase, outlen);
 
-  if(single_ended) strcpy(out0path+outlen, ".fq.gz");
+  if(single_ended) strcpy(out0path+outlen, ".fa.gz");
   else {
-    strcpy(out0path+outlen, ".1.fq.gz");
-    strcpy(out1path+outlen, ".2.fq.gz");
+    strcpy(out0path+outlen, ".1.fa.gz");
+    strcpy(out1path+outlen, ".2.fa.gz");
   }
 
   gzFile gzout0 = NULL, gzout1 = NULL;
