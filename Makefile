@@ -1,6 +1,6 @@
 ifdef HTSLIB
 	HTSARGS=-I $(HTSLIB)/htslib -L $(HTSLIB)/htslib -D_USESAM=1
-	LIBS=-lhts -lz -lm
+	LIBS=-lhts -lpthread -lz -lm
 else
 	HTSARGS=
 	LIBS=-lz -lm
