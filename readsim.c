@@ -20,8 +20,10 @@ static const char usage[] =
 "  -p <profile.fq> apply errors with distribution as seen in profile.fq\n"
 " Simulate reads:\n"
 "  -r <ref.fa>  sample reads from ref\n"
-"  -t <t>       template size (insert size + 2*(read length)) [800]\n"
-"  -v <v>       variance on template size as a proportion [0.1]\n"
+// "  -t <t>       template size (insert size + 2*(read length)) [800]\n"
+// "  -v <v>       variance on template size as a proportion [0.1]\n"
+"  -i <t>       insert size [250]\n"
+"  -v <v>       variance on insert size as a proportion [0.2 => 50bp]\n"
 "  -l <l>       read length [250]\n"
 "  -d <d>       sequencing depth [1]\n"
 " Load reads:\n"
@@ -31,10 +33,15 @@ static const char usage[] =
 #define MAX2(x,y) ((x) >= (y) ? (x) : (y))
 #define MIN2(x,y) ((x) <= (y) ? (x) : (y))
 
+#define ROUNDUP2POW(x) (0x1UL << (64 - __builtin_clzl(x)))
+
+#define phred_to_prob(qual) powl(10, -(double)(qual)/10)
+
 // Sample a random number from normal distribution with [mean 0, stddev 1]
-// From Heng Li
+// N(mean,stddev) = mean + ran_normal()*stddev
 // http://en.wikipedia.org/wiki/Box_Muller_transform#Polar_form
 // http://en.wikipedia.org/wiki/Marsaglia_polar_method
+// From Heng Li
 double ran_normal()
 { 
   static int iset = 0; 
@@ -90,165 +97,79 @@ void call_die(const char *file, int line, const char *fmt, ...)
   exit(EXIT_FAILURE);
 }
 
-char test_file_readable(const char *file)
+typedef struct
 {
-  FILE *fp = fopen(file, "r");
-  if(fp == NULL) return 0;
-  fclose(fp);
-  return 1;
-}
+  seq_file_t **files;
+  size_t num_files, curr, filesready;
+  read_t read;
+  size_t *errors, errors_len, errors_cap;
+} FileList;
 
-#define phred_to_prob(qual) powl(10, -(double)(qual)/10)
-
-void sum_qual_scores(const read_t *read, int qoffset,
-                     double *qprob_sum, size_t *counts, size_t len)
-{
-  size_t i, limit = len < read->qual.end ? len : read->qual.end;
-  double qual;
-
-  if(read->qual.end != read->seq.end) die("Invalid qual");
-
-  for(i = 0; i < read->qual.end; i++) {
-    if(read->qual.b[i] < qoffset) die("Invalid qual");
-    if(read->qual.b[i] - qoffset > 50) die("Invalid qual");
-    read->qual.b[i] -= qoffset;
-  }
-
-  for(i = 0; i < limit; i++) {
-    if(toupper(read->seq.b[i]) != 'N') {
-      qual = phred_to_prob(read->qual.b[i]);
-      qprob_sum[i] += qual;
-      counts[i]++;
-    }
-  }
-}
-
-size_t extend_arrays(size_t currlen, size_t newlen, double **qprob, size_t **counts)
+void filelist_alloc(FileList *flist, char **paths, size_t num)
 {
   size_t i;
-  *qprob = realloc(*qprob, newlen * sizeof(double));
-  *counts = realloc(*counts, newlen * sizeof(size_t));
-  if(*counts == NULL || *qprob == NULL) die("Out of memory");
-  for(i = currlen; i < newlen; i++) { (*qprob)[i] = 0; (*counts)[i] = 0; }
-  return newlen;
+  flist->num_files = num;
+  flist->curr = 0;
+  flist->files = malloc(num * sizeof(seq_file_t*));
+
+  for(i = 0; i < num; i++)
+    if((flist->files[i] = seq_open(paths[i])) == NULL)
+      die("Cannot open: %s", paths[i]);
+
+  seq_read_alloc(&flist->read);
+  flist->filesready = 1;
+  flist->errors_cap = 512;
+  flist->errors_len = 0;
+  flist->errors = calloc(flist->errors_cap, sizeof(size_t));
 }
 
-// Returns length of first read
-void load_error_profile(seq_file_t **files, size_t num_files,
-                        read_t **rptr, size_t *nreadsptr)
+void filelist_dealloc(FileList *flist)
 {
-  int qoffset, minq, maxq, fmt;
+  size_t i;
+  for(i = 0; i < flist->num_files; i++) seq_close(flist->files[i]);
+  seq_read_dealloc(&flist->read);
+  free(flist->files);
+  free(flist->errors);
+}
 
-  size_t i, f, longest_read = 0;
-  size_t *counts = NULL;
-  double *qprob = NULL;
-  size_t sumlen = 0, meanlen = 0, maxlen = 0, minlen = SIZE_MAX;
-
-  size_t rcap = 16, rlen = 0;
-  read_t *r = malloc(rcap * sizeof(read_t));
-
-  printf("Loading calibration reads...\n");
-
-  for(f = 0; f < num_files; f++)
+read_t* filelist_read(FileList *flist)
+{
+  read_t *r = &flist->read;
+  size_t i;
+  for(i = 0; seq_read(flist->files[flist->curr], r) <= 0 && i < flist->num_files; i++)
   {
-    // Get FASTQ offset
-    if((fmt = seq_guess_fastq_format(files[f], &minq, &maxq)) == -1)
-      die("Cannot get quality score from: %s", files[f]->path);
-
-    qoffset = FASTQ_OFFSET[fmt];
-    printf(" reading: %s  [FASTQ offset: %i]\n", files[f]->path, qoffset);
-
-    if(!seq_read_alloc(&r[rlen])) die("Out of memory");
-    if(seq_read(files[f], &r[rlen]) <= 0)
-      die("Empty profile file %s", files[f]->path);
-
-    if(counts == NULL) {
-      longest_read = r[rlen].seq.end;
-      qprob = malloc(longest_read * sizeof(double));
-      counts = calloc(longest_read, sizeof(size_t));
-      if(counts == NULL || qprob == NULL) die("Out of memory");
-      for(i = 0; i < longest_read; i++) qprob[i] = 0.0;
-    }
-    else if(r[rlen].seq.end > longest_read)
-      longest_read = extend_arrays(longest_read, r[rlen].seq.end, &qprob, &counts);
-
-    sum_qual_scores(&r[rlen], qoffset, qprob, counts, r[rlen].seq.end);
-    sumlen += r[rlen].seq.end;
-    maxlen = MAX2(maxlen, r[rlen].seq.end);
-    minlen = MIN2(minlen, r[rlen].seq.end);
-    rlen++;
-
-    while(1) {
-      if(rlen == rcap) { r = realloc(r, (rcap *= 2) * sizeof(read_t)); }
-      if(!seq_read_alloc(&r[rlen])) die("Out of memory");
-      if(seq_read(files[f], &r[rlen]) <= 0) { seq_read_dealloc(&r[rlen]); break; }
-      if(r[rlen].seq.end > longest_read)
-        longest_read = extend_arrays(longest_read, r[rlen].seq.end, &qprob, &counts);
-      sum_qual_scores(&r[rlen], qoffset, qprob, counts, r[rlen].seq.end);
-      sumlen += r[rlen].seq.end;
-      maxlen = MAX2(maxlen, r[rlen].seq.end);
-      minlen = MIN2(minlen, r[rlen].seq.end);
-      rlen++;
+    flist->curr++;
+    if(flist->curr == flist->num_files) { flist->curr = flist->filesready = 0; }
+    if(!flist->filesready) {
+      char path[PATH_MAX+1];
+      strcpy(path, flist->files[flist->curr]->path);
+      seq_close(flist->files[flist->curr]);
+      seq_open(path);
     }
   }
+  if(i == flist->num_files) die("All seq files empty");
+  return r;
+}
 
-  meanlen = sumlen / rlen;
-
-  printf("Number of calibration reads: %zu\n", rlen);
-  printf("MeanReadLen: %zu; MinReadLen: %zu; MaxReadLen: %zu\n",
-         meanlen, minlen, maxlen);
-
-  // Normalise qprob
-  // double qmean = qtotal / len, err_rate = 0.01;
-  // for(i = 0; i < len; i++)
-  //   qprob[i] = err_rate * qprob[i] / qmean;
-
-  if(rlen == 0) {
-    printf("Counts: \nCountsMean: 0\n");
-    printf("QProb: \nQProbMean: 0\n");
+void filelist_extend_errarr(FileList *flist, size_t len)
+{
+  size_t i, oldcap = flist->errors_cap;
+  flist->errors_len = MAX2(flist->errors_len, len);
+  if(len > flist->errors_cap) {
+    flist->errors_cap = ROUNDUP2POW(len);
+    flist->errors = realloc(flist->errors, flist->errors_cap * sizeof(size_t));
+    for(i = oldcap; i < flist->errors_cap; i++) flist->errors[i] = 0;
   }
-  else
-  {
-    size_t sumcount;
-    double sumprob;
-
-    sumcount = counts[0];
-    printf("Counts: %zu", counts[0]);
-    for(i = 1; i < longest_read; i++) {
-      printf(",%zu", counts[i]);
-      sumcount += counts[i];
-    }
-    printf("\nCountsMean: %zu\n", sumcount / longest_read);
-
-    sumprob = qprob[0];
-    printf("QProb: %f", qprob[0] / counts[0]);
-    for(i = 1; i < longest_read; i++) {
-      printf(",%f", qprob[i] / counts[i]);
-      sumprob += qprob[i];
-    }
-    printf("\nQProbMean: %f\n", sumprob / sumcount);
-  }
-
-  free(qprob);
-  free(counts);
-
-  *rptr = r;
-  *nreadsptr = rlen;
 }
 
 static inline char dna_complement(char c)
 {
   switch(c) {
-    case 'a': return 't';
-    case 'c': return 'g';
-    case 'g': return 'c';
-    case 't': return 'a';
-    case 'A': return 'T';
-    case 'C': return 'G';
-    case 'G': return 'C';
-    case 'T': return 'A';
-    case 'N': return 'N';
-    case 'n': return 'n';
+    case 'a': return 't'; case 'A': return 'T';
+    case 'c': return 'g'; case 'C': return 'G';
+    case 'g': return 'c'; case 'G': return 'C';
+    case 't': return 'a'; case 'T': return 'A';
+    case 'n': return 'n'; case 'N': return 'N';
     default: die("Invalid base: '%c'", c);
   }
   die("Invalid base: '%c'", c);
@@ -282,36 +203,37 @@ static inline char mut(char c, int i)
   return bases[b+i];
 }
 
-void add_seq_error(char *seq, size_t seqlen, const read_t *r)
+void add_seq_error(char *seq, size_t seqlen, FileList *flist)
 {
+  const read_t *r = filelist_read(flist);
+  filelist_extend_errarr(flist, seqlen);
   size_t i, limit = seqlen < r->seq.end ? seqlen : r->seq.end;
   int rnd;
   for(i = 0; i < limit; i++) {
-    if(r->seq.b[i] == 'N') seq[i] = 'N';
-    else if((rnd = rand()) < phred_to_prob(r->qual.b[i]) * RAND_MAX)
+    if(seq[i] == 'N' || r->seq.b[i] == 'N') seq[i] = 'N';
+    else if((rnd = rand()) < phred_to_prob(r->qual.b[i]) * RAND_MAX) {
       seq[i] = mut(seq[i], rnd % 3);
+      flist->errors[i]++;
+    }
   }
 }
 
 // Load reads from a file, apply sequence error, dump
-void mutate_reads(seq_file_t *sfile, gzFile gzout,
-                  const read_t *rlist, size_t nreads)
+void mutate_reads(seq_file_t *sfile, gzFile gzout, FileList *flist)
 {
   printf(" reading: %s\n", sfile->path);
   read_t r;
-  size_t rndread;
   seq_read_alloc(&r);
 
   while(seq_read(sfile, &r) > 0) {
-    rndread = drand48() * nreads;
-    add_seq_error(r.seq.b, r.seq.end, &rlist[rndread]);
+    add_seq_error(r.seq.b, r.seq.end, flist);
     gzprintf(gzout, "@%s\n%s\n+\n%s\n", r.name.b, r.seq.b, r.qual.b);
   }
 
   seq_read_dealloc(&r);
 }
 
-size_t rand_chrom(read_t *chroms, size_t nchroms, size_t totallen)
+static size_t rand_chrom(read_t *chroms, size_t nchroms, size_t totallen)
 {
   uint64_t i, r = (((uint64_t)rand()) << 32) | rand();
   r %= totallen;
@@ -323,11 +245,13 @@ size_t rand_chrom(read_t *chroms, size_t nchroms, size_t totallen)
 
 // Returns ref genome size
 size_t sim_reads(seq_file_t *reffile, gzFile out0, gzFile out1,
-                 const read_t *rlist, size_t rlistlen,
-                 size_t tlen, double tlen_stddev, size_t rlen, double depth)
+                 FileList *flist,
+                 size_t insert, double insert_stddev, size_t rlen, double depth)
 {
-  size_t i, chromcap = 16, nchroms, glen = 0, nreads, chr, pos0, pos1;
+  size_t i, chromcap = 16, nchroms, glen = 0, nreads, chr, pos0, pos1, tlen;
   read_t *chroms;
+
+  tlen = rlen + (out1 == NULL ? 0 : insert + rlen);
 
   chroms = malloc(chromcap * sizeof(read_t));
   nchroms = 0;
@@ -336,9 +260,10 @@ size_t sim_reads(seq_file_t *reffile, gzFile out0, gzFile out1,
   printf(" Loaded contigs:");
   while(1)
   {
-    if(nchroms == chromcap) chroms = realloc(chroms, (chromcap *= 2) * sizeof(read_t));
+    if(nchroms == chromcap) chroms = realloc(chroms, (chromcap*=2)*sizeof(read_t));
     seq_read_alloc(&chroms[nchroms]);
-    if(seq_read(reffile, &chroms[nchroms]) <= 0) { seq_read_dealloc(&chroms[nchroms]); break; }
+    if(seq_read(reffile, &chroms[nchroms]) <= 0)
+    { seq_read_dealloc(&chroms[nchroms]); break; }
     if(chroms[nchroms].seq.end < tlen) { seq_read_dealloc(&chroms[nchroms]); }
     else {
       seq_read_truncate_name(&chroms[nchroms]);
@@ -370,14 +295,14 @@ size_t sim_reads(seq_file_t *reffile, gzFile out0, gzFile out1,
     pos1 = pos0;
     memcpy(read0, chroms[chr].seq.b+pos0, rlen);
     if(out1 != NULL) {
-      pos1 = pos0 + tlen + ran_normal()*tlen*tlen_stddev - rlen;
+      pos1 = pos0 + rlen + insert + ran_normal()*insert_stddev;
       if(pos1 + rlen > chroms[chr].seq.end) pos1 = chroms[chr].seq.end-rlen;
       memcpy(read1, chroms[chr].seq.b+pos1, rlen);
     }
-    if(rlistlen > 0) {
-      add_seq_error(read0, rlen, &rlist[(int)(drand48() * rlistlen)]);
+    if(flist != NULL) {
+      add_seq_error(read0, rlen, flist);
       if(out1 != NULL)
-        add_seq_error(read1, rlen, &rlist[(int)(drand48() * rlistlen)]);
+        add_seq_error(read1, rlen, flist);
     }
     gzprintf(out0, ">r%zu:0:%s:%zu:%zu\n%.*s\n", i, chroms[chr].name.b,
                    pos0, pos1, (int)rlen, read0);
@@ -401,22 +326,25 @@ int main(int argc, char **argv)
 
   // Sample reads from ref
   char *refpath = NULL;
-  int tlen = 800, rlen = 250, single_ended = 0;
-  double depth = 1.0, tlen_stddev = 0.1; // stddev as proportion of tlen
-  int optr = 0, optt = 0, optv = 0, optl = 0, optd = 0; // keeps track of values
+  // int optt = 0, tlen = 800; double tlen_stddev = 0.1;
+  int insert = 250, rlen = 250, single_ended = 0;
+  double depth = 1.0, insert_stddev_prop = 0.2; // stddev as proportion of insert
+  int optr = 0, opti = 0, optv = 0, optl = 0, optd = 0; // keeps track of values
 
   char *in0path = NULL, *in1path = NULL;
 
   char *profile_paths[argc];
-  int i, num_profile_paths = 0;
+  size_t num_profile_paths = 0;
 
   int c;
-  while((c = getopt(argc, argv, "p:r:t:v:l:d:s1:2:")) >= 0) {
+  while((c = getopt(argc, argv, "p:r:i:v:l:d:s1:2:")) >= 0) {
     switch (c) {
       case 'p': profile_paths[num_profile_paths++] = optarg; break;
       case 'r': refpath = optarg; optr++; break;
-      case 't': tlen = atoi(optarg); optt++; break;
-      case 'v': tlen_stddev = atof(optarg); optv++; break;
+      // case 't': tlen = atoi(optarg); optt++; break;
+      // case 'v': tlen_stddev = atof(optarg); optv++; break;
+      case 'i': insert = atoi(optarg); opti++; break;
+      case 'v': insert_stddev_prop = atof(optarg); optv++; break;
       case 'l': rlen = atoi(optarg); optl++; break;
       case 'd': depth = atof(optarg); optd++; break;
       case 's': single_ended = 1; break;
@@ -433,13 +361,13 @@ int main(int argc, char **argv)
 
   if(depth <= 0) print_usage(usage, "Depth [-d] cannot be <= 0");
 
-  if(tlen_stddev < 0)
-    print_usage(usage, "Template length standard deviation [-v] cannot be < 0");
+  if(insert_stddev_prop < 0)
+    print_usage(usage, "Insert length standard deviation [-v] cannot be < 0");
 
-  if((optt > 0 || optv > 0 || optl > 0 || optd > 0) && refpath == NULL)
+  if((opti > 0 || optv > 0 || optl > 0 || optd > 0) && refpath == NULL)
     print_usage(usage, "Missing -r <in.fa>");
 
-  if(optr > 1 || optt > 1 || optv > 1 || optl > 1 || optd > 1)
+  if(optr > 1 || opti > 1 || optv > 1 || optl > 1 || optd > 1)
     print_usage(usage, "Duplicate args");
 
   if(in0path == NULL && in1path != NULL)
@@ -456,11 +384,12 @@ int main(int argc, char **argv)
   if(num_profile_paths == 0 && refpath == NULL)
     print_usage(usage, "Need one of -p or -r");
 
-  seq_file_t *profile_sf[num_profile_paths];
-
-  for(i = 0; i < num_profile_paths; i++)
-    if((profile_sf[i] = seq_open(profile_paths[i])) == NULL)
-      die("Cannot open file: %s", profile_paths[i]);
+  // Profile reads
+  FileList fliststore, *flist = NULL;
+  if(num_profile_paths > 0) {
+    flist = &fliststore;
+    filelist_alloc(flist, profile_paths, num_profile_paths);
+  }
 
   size_t outlen = strlen(outbase), extlen = strlen(".1.fa.gz");
   char out0path[outlen+extlen+1], out1path[outlen+extlen+1];
@@ -475,6 +404,7 @@ int main(int argc, char **argv)
 
   gzFile gzout0 = NULL, gzout1 = NULL;
   seq_file_t *sf0 = NULL, *sf1 = NULL, *reffile = NULL;
+  size_t i;
 
   if(in0path != NULL && (sf0 = seq_open(in0path)) == NULL) die("Cannot read: %s", in0path);
   if(in1path != NULL && (sf1 = seq_open(in1path)) == NULL) die("Cannot read: %s", in1path);
@@ -487,23 +417,10 @@ int main(int argc, char **argv)
       die("Cannot open: %s", out1path);
   }
 
-  // Generate profile from profile.fq
-  size_t r, rlistlen = 0;
-  read_t *rlist = NULL;
-
-  // Load existing `profile' reads
-  if(num_profile_paths > 0)
-  {
-    load_error_profile(profile_sf, num_profile_paths, &rlist, &rlistlen);
-
-    for(i = 0; i < num_profile_paths; i++)
-      seq_close(profile_sf[i]);
-  }
-
   if(sf0 != NULL) printf("Adding error to input reads...\n");
-  if(sf0 != NULL) { mutate_reads(sf0, gzout0, rlist, rlistlen); seq_close(sf0); }
+  if(sf0 != NULL) { mutate_reads(sf0, gzout0, flist); seq_close(sf0); }
   if(sf1 != NULL) {
-    mutate_reads(sf1, single_ended ? gzout0 : gzout1, rlist, rlistlen);
+    mutate_reads(sf1, single_ended ? gzout0 : gzout1, flist);
     seq_close(sf1);
   }
 
@@ -511,12 +428,20 @@ int main(int argc, char **argv)
   {
     printf("Sampling from %s\n", refpath);
     printf(" read length: %i\n", rlen);
-    printf(" template length: %i\n", tlen);
-    printf(" template stddev: %.2f * tlen = %.2f\n", tlen_stddev, tlen_stddev*tlen);
+    printf(" insert length: %i\n", insert);
+    printf(" insert stddev: %.2f * insert = %.2f\n",
+           insert_stddev_prop, insert_stddev_prop*insert);
     printf(" sequencing depth: %.2f\n", depth);
     printf(" read pairs: %s\n", single_ended ? "no" : "yes");
-    sim_reads(reffile, gzout0, gzout1, rlist, rlistlen,
-              tlen, tlen_stddev, rlen, depth);
+    if(num_profile_paths == 0) printf(" sequencing errors: no\n");
+    else {
+      printf(" seq error files: %s", flist->files[0]->path);
+      for(i = 1; i < num_profile_paths; i++)
+        printf(",%s", flist->files[i]->path);
+      printf("\n");
+    }
+    sim_reads(reffile, gzout0, gzout1, flist,
+              insert, insert_stddev_prop*insert, rlen, depth);
     seq_close(reffile);
   }
 
@@ -528,9 +453,14 @@ int main(int argc, char **argv)
   if(gzout0 != NULL) gzclose(gzout0);
   if(gzout1 != NULL) gzclose(gzout1);
 
-  if(rlist != NULL) {
-    for(r = 0; r < rlistlen; r++) seq_read_dealloc(&rlist[r]);
-    free(rlist);
+  if(flist != NULL)
+  {
+    // Print error distribution
+    printf("Errors:\n");
+    for(i = 0; i < flist->errors_len; i++) printf(" %zu", flist->errors[i]);
+    printf("\n");
+
+    filelist_dealloc(flist);
   }
 
   return EXIT_SUCCESS;
