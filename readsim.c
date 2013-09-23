@@ -135,8 +135,8 @@ void filelist_dealloc(FileList *flist)
 read_t* filelist_read(FileList *flist)
 {
   read_t *r = &flist->read;
-  size_t i;
-  for(i = 0; seq_read(flist->files[flist->curr], r) <= 0 && i < flist->num_files; i++)
+  size_t i; // i is number of file changes
+  for(i = 0; seq_read(flist->files[flist->curr], r) <= 0 && i <= flist->num_files; i++)
   {
     flist->curr++;
     if(flist->curr == flist->num_files) { flist->curr = flist->filesready = 0; }
@@ -147,7 +147,7 @@ read_t* filelist_read(FileList *flist)
       seq_open(path);
     }
   }
-  if(i == flist->num_files) die("All seq files empty");
+  if(i > flist->num_files) die("All seq files empty");
   return r;
 }
 
