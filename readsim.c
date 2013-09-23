@@ -100,6 +100,7 @@ void call_die(const char *file, int line, const char *fmt, ...)
 typedef struct
 {
   seq_file_t **files;
+  int *fqoffsets;
   size_t num_files, curr, filesready;
   read_t read;
   size_t *errors, errors_len, errors_cap;
@@ -111,10 +112,16 @@ void filelist_alloc(FileList *flist, char **paths, size_t num)
   flist->num_files = num;
   flist->curr = 0;
   flist->files = malloc(num * sizeof(seq_file_t*));
+  flist->fqoffsets = malloc(num * sizeof(int));
 
-  for(i = 0; i < num; i++)
+  for(i = 0; i < num; i++) {
     if((flist->files[i] = seq_open(paths[i])) == NULL)
       die("Cannot open: %s", paths[i]);
+    int min, max, fmt;
+    fmt = seq_guess_fastq_format(flist->files[i], &min, &max);
+    flist->fqoffsets[i] = FASTQ_OFFSET[fmt];
+    printf(" profile: %s [offset: %i]\n", paths[i], FASTQ_OFFSET[fmt]);
+  }
 
   seq_read_alloc(&flist->read);
   flist->filesready = 1;
@@ -129,6 +136,7 @@ void filelist_dealloc(FileList *flist)
   for(i = 0; i < flist->num_files; i++) seq_close(flist->files[i]);
   seq_read_dealloc(&flist->read);
   free(flist->files);
+  free(flist->fqoffsets);
   free(flist->errors);
 }
 
@@ -206,12 +214,13 @@ static inline char mut(char c, int i)
 void add_seq_error(char *seq, size_t seqlen, FileList *flist)
 {
   const read_t *r = filelist_read(flist);
+  int fqoffset = flist->fqoffsets[flist->curr];
   filelist_extend_errarr(flist, seqlen);
   size_t i, limit = MIN2(seqlen, r->seq.end);
   int rnd;
   for(i = 0; i < limit; i++) {
     if(seq[i] == 'N' || r->seq.b[i] == 'N') seq[i] = 'N';
-    else if((rnd = rand()) < phred_to_prob(r->qual.b[i]) * RAND_MAX) {
+    else if((rnd = rand()) < phred_to_prob(r->qual.b[i] - fqoffset) * RAND_MAX) {
       seq[i] = mut(seq[i], rnd % 3);
       flist->errors[i]++;
     }
