@@ -207,7 +207,7 @@ void add_seq_error(char *seq, size_t seqlen, FileList *flist)
 {
   const read_t *r = filelist_read(flist);
   filelist_extend_errarr(flist, seqlen);
-  size_t i, limit = seqlen < r->seq.end ? seqlen : r->seq.end;
+  size_t i, limit = MIN2(seqlen, r->seq.end);
   int rnd;
   for(i = 0; i < limit; i++) {
     if(seq[i] == 'N' || r->seq.b[i] == 'N') seq[i] = 'N';
@@ -219,18 +219,22 @@ void add_seq_error(char *seq, size_t seqlen, FileList *flist)
 }
 
 // Load reads from a file, apply sequence error, dump
-void mutate_reads(seq_file_t *sfile, gzFile gzout, FileList *flist)
+// Return total number of bases
+size_t mutate_reads(seq_file_t *sfile, gzFile gzout, FileList *flist)
 {
   printf(" reading: %s\n", sfile->path);
   read_t r;
   seq_read_alloc(&r);
+  size_t num_bases = 0;
 
   while(seq_read(sfile, &r) > 0) {
     add_seq_error(r.seq.b, r.seq.end, flist);
     gzprintf(gzout, "@%s\n%s\n+\n%s\n", r.name.b, r.seq.b, r.qual.b);
+    num_bases += r.seq.end;
   }
 
   seq_read_dealloc(&r);
+  return num_bases;
 }
 
 static size_t rand_chrom(read_t *chroms, size_t nchroms, size_t totallen)
@@ -243,7 +247,7 @@ static size_t rand_chrom(read_t *chroms, size_t nchroms, size_t totallen)
   die("Shouldn't reach here");
 }
 
-// Returns ref genome size
+// Returns num of bases printed
 size_t sim_reads(seq_file_t *reffile, gzFile out0, gzFile out1,
                  FileList *flist,
                  size_t insert, double insert_stddev, size_t rlen, double depth)
@@ -316,7 +320,10 @@ size_t sim_reads(seq_file_t *reffile, gzFile out0, gzFile out1,
   for(i = 0; i < nchroms; i++) seq_read_dealloc(&chroms[i]);
   free(chroms);
 
-  return glen;
+  size_t num_bases = nreads * rlen;
+  if(out1 != NULL) num_bases *= 2;
+
+  return num_bases;
 }
 
 int main(int argc, char **argv)
@@ -404,7 +411,7 @@ int main(int argc, char **argv)
 
   gzFile gzout0 = NULL, gzout1 = NULL;
   seq_file_t *sf0 = NULL, *sf1 = NULL, *reffile = NULL;
-  size_t i;
+  size_t i, total_seq = 0;
 
   if(in0path != NULL && (sf0 = seq_open(in0path)) == NULL) die("Cannot read: %s", in0path);
   if(in1path != NULL && (sf1 = seq_open(in1path)) == NULL) die("Cannot read: %s", in1path);
@@ -417,10 +424,13 @@ int main(int argc, char **argv)
       die("Cannot open: %s", out1path);
   }
 
-  if(sf0 != NULL) printf("Adding error to input reads...\n");
-  if(sf0 != NULL) { mutate_reads(sf0, gzout0, flist); seq_close(sf0); }
+  if(sf0 != NULL) {
+    printf("Adding error to input reads...\n");
+    total_seq += mutate_reads(sf0, gzout0, flist);
+    seq_close(sf0);
+  }
   if(sf1 != NULL) {
-    mutate_reads(sf1, single_ended ? gzout0 : gzout1, flist);
+    total_seq += mutate_reads(sf1, single_ended ? gzout0 : gzout1, flist);
     seq_close(sf1);
   }
 
@@ -440,15 +450,15 @@ int main(int argc, char **argv)
         printf(",%s", flist->files[i]->path);
       printf("\n");
     }
-    sim_reads(reffile, gzout0, gzout1, flist,
-              insert, insert_stddev_prop*insert, rlen, depth);
+    total_seq += sim_reads(reffile, gzout0, gzout1, flist,
+                           insert, insert_stddev_prop*insert, rlen, depth);
     seq_close(reffile);
   }
 
   if(gzout1 != NULL && gzout1 != NULL)
-    printf("Wrote to: %s and %s\n", out0path, out1path);
+    printf("Wrote %zu bases to: %s and %s\n", total_seq, out0path, out1path);
   else if(gzout0 != NULL)
-    printf("Wrote to: %s\n", out0path);
+    printf("Wrote %zu bases to: %s\n", total_seq, out0path);
 
   if(gzout0 != NULL) gzclose(gzout0);
   if(gzout1 != NULL) gzclose(gzout1);
@@ -456,7 +466,9 @@ int main(int argc, char **argv)
   if(flist != NULL)
   {
     // Print error distribution
-    printf("Errors:\n");
+    size_t err_total = 0;
+    for(i = 0; i < flist->errors_len; i++) err_total += flist->errors[i];
+    printf("Errors: %zu (%.2f%%)\n", err_total, (100.0*err_total) / total_seq);
     for(i = 0; i < flist->errors_len; i++) printf(" %zu", flist->errors[i]);
     printf("\n");
 
