@@ -5,6 +5,7 @@
 #include <inttypes.h>
 #include <string.h>
 #include <strings.h>
+#include <limits.h>
 #include <math.h>
 #include <zlib.h>
 #include <time.h>
@@ -35,7 +36,17 @@ static const char usage[] =
 
 #define ROUNDUP2POW(x) (0x1UL << (64 - __builtin_clzl(x)))
 
-#define phred_to_prob(qual) powl(10, -(double)(qual)/10)
+#define phred_to_prob(qual) powl(10, -(double)(qual)/10.0)
+#define phred_to_lprob(qual) powl(10, -(long double)(qual)/10.0)
+
+#define MAXQUAL 60
+double qual_prob[MAXQUAL];
+
+static void init_qual_prob()
+{
+  size_t i;
+  for(i = 0; i < MAXQUAL; i++) qual_prob[i] = phred_to_prob(i);
+}
 
 // Sample a random number from normal distribution with [mean 0, stddev 1]
 // N(mean,stddev) = mean + ran_normal()*stddev
@@ -170,6 +181,48 @@ void filelist_extend_errarr(FileList *flist, size_t len)
   }
 }
 
+void filelist_mean_err(FileList *flist)
+{
+  size_t i, f, maxread = 0, readcap = 512, newcap, carry;
+  long double *sumprob = malloc(readcap * sizeof(long double));
+  size_t *counts = malloc(readcap * sizeof(size_t));
+  for(i = 0; i < readcap; i++) { sumprob[i] = 0; counts[i] = 0; }
+
+  read_t *r = &flist->read;
+  int fmt, fqoffset, minq, maxq;
+  for(f = flist->curr; f < flist->num_files; f++) {
+    fmt = seq_guess_fastq_format(flist->files[f], &minq, &maxq);
+    if(fmt != -1) fqoffset = FASTQ_OFFSET[fmt];
+    while(seq_read(flist->files[f], r) > 0) {
+      if(r->qual.end > readcap) {
+        newcap = ROUNDUP2POW(r->qual.end);
+        sumprob = realloc(sumprob, newcap * sizeof(long double));
+        counts = realloc(counts, newcap * sizeof(size_t));
+        for(i = readcap; i < newcap; i++) { sumprob[i] = 0; counts[i] = 0; }
+        readcap = newcap;
+      }
+      counts[r->qual.end-1]++;
+      for(i = 0; i < r->qual.end; i++)
+        sumprob[i] += qual_prob[r->qual.b[i] - fqoffset];
+      maxread = MAX2(maxread, r->qual.end);
+    }
+  }
+
+  // Convert counts to cummulative (reverse)
+  for(i = maxread-1, carry = 0; i != SIZE_MAX; i--) {
+    carry += counts[i];
+    counts[i] = carry;
+  }
+
+  for(i = 0; i < maxread; i++) {
+    // printf(" %.8Lf/%zu", sumprob[i], counts[i]);
+    printf(" %.2Lf", 100.0 * sumprob[i] / counts[i]);
+  } printf("\n");
+
+  free(counts);
+  free(sumprob);
+}
+
 static inline char dna_complement(char c)
 {
   switch(c) {
@@ -219,8 +272,8 @@ void add_seq_error(char *seq, size_t seqlen, FileList *flist)
   size_t i, limit = MIN2(seqlen, r->seq.end);
   int rnd;
   for(i = 0; i < limit; i++) {
-    if(seq[i] == 'N' || r->seq.b[i] == 'N') seq[i] = 'N';
-    else if((rnd = rand()) < phred_to_prob(r->qual.b[i] - fqoffset) * RAND_MAX) {
+    if(toupper(seq[i]) == 'N' || toupper(r->seq.b[i]) == 'N') seq[i] = 'N';
+    else if((rnd = rand()) < qual_prob[r->qual.b[i] - fqoffset] * RAND_MAX) {
       seq[i] = mut(seq[i], rnd % 3);
       flist->errors[i]++;
     }
@@ -337,8 +390,10 @@ size_t sim_reads(seq_file_t *reffile, gzFile out0, gzFile out1,
 
 int main(int argc, char **argv)
 {
-  if(argc < 4) print_usage(usage, NULL);
+  if(argc < 3) print_usage(usage, NULL);
   srand(time(NULL) + getpid());
+
+  init_qual_prob();
 
   // Sample reads from ref
   char *refpath = NULL;
@@ -350,7 +405,7 @@ int main(int argc, char **argv)
   char *in0path = NULL, *in1path = NULL;
 
   char *profile_paths[argc];
-  size_t num_profile_paths = 0;
+  size_t num_profile_paths = 0, i, total_seq = 0;
 
   int c;
   while((c = getopt(argc, argv, "p:r:i:v:l:d:s1:2:")) >= 0) {
@@ -370,10 +425,11 @@ int main(int argc, char **argv)
     }
   }
 
-  char *outbase = argv[optind];
+  char *outbase = NULL;
 
-  if(argc == optind) print_usage(usage, "Missing <out_base>");
-  if(argc > optind + 1) print_usage(usage, "Too many args after %s", outbase);
+  if(optind == argc) {}//print_usage(usage, "Missing <out_base>");
+  else if(optind + 1 == argc) outbase = argv[optind];
+  else if(optind + 1 < argc) print_usage(usage, "Too many args after %s", outbase);
 
   if(depth <= 0) print_usage(usage, "Depth [-d] cannot be <= 0");
 
@@ -400,6 +456,9 @@ int main(int argc, char **argv)
   if(num_profile_paths == 0 && refpath == NULL)
     print_usage(usage, "Need one of -p or -r");
 
+  if(num_profile_paths == 0 && outbase == NULL)
+    print_usage(usage, "More options required");
+
   // Profile reads
   FileList fliststore, *flist = NULL;
   if(num_profile_paths > 0) {
@@ -407,70 +466,78 @@ int main(int argc, char **argv)
     filelist_alloc(flist, profile_paths, num_profile_paths);
   }
 
-  size_t outlen = strlen(outbase), extlen = strlen(".1.fa.gz");
-  char out0path[outlen+extlen+1], out1path[outlen+extlen+1];
-  memcpy(out0path, outbase, outlen);
-  memcpy(out1path, outbase, outlen);
-
-  if(single_ended) strcpy(out0path+outlen, ".fa.gz");
-  else {
-    strcpy(out0path+outlen, ".1.fa.gz");
-    strcpy(out1path+outlen, ".2.fa.gz");
-  }
-
-  gzFile gzout0 = NULL, gzout1 = NULL;
-  seq_file_t *sf0 = NULL, *sf1 = NULL, *reffile = NULL;
-  size_t i, total_seq = 0;
-
-  if(in0path != NULL && (sf0 = seq_open(in0path)) == NULL) die("Cannot read: %s", in0path);
-  if(in1path != NULL && (sf1 = seq_open(in1path)) == NULL) die("Cannot read: %s", in1path);
-
-  if(refpath != NULL)
+  if(outbase == NULL)
   {
-    if((reffile = seq_open(refpath)) == NULL) die("Cannot read: %s", refpath);
-    if((gzout0 = gzopen(out0path, "w")) == NULL) die("Cannot open: %s", out0path);
-    if(!single_ended && (gzout1 = gzopen(out1path, "w")) == NULL)
-      die("Cannot open: %s", out1path);
+    // Summarise error profile in input
+    filelist_mean_err(flist);
   }
-
-  if(sf0 != NULL) {
-    printf("Adding error to input reads...\n");
-    total_seq += mutate_reads(sf0, gzout0, flist);
-    seq_close(sf0);
-  }
-  if(sf1 != NULL) {
-    total_seq += mutate_reads(sf1, single_ended ? gzout0 : gzout1, flist);
-    seq_close(sf1);
-  }
-
-  if(refpath != NULL)
+  else
   {
-    printf("Sampling from %s\n", refpath);
-    printf(" read length: %i\n", rlen);
-    printf(" insert length: %i\n", insert);
-    printf(" insert stddev: %.2f * insert = %.2f\n",
-           insert_stddev_prop, insert_stddev_prop*insert);
-    printf(" sequencing depth: %.2f\n", depth);
-    printf(" read pairs: %s\n", single_ended ? "no" : "yes");
-    if(num_profile_paths == 0) printf(" sequencing errors: no\n");
+    size_t outlen = strlen(outbase), extlen = strlen(".1.fa.gz");
+    char out0path[outlen+extlen+1], out1path[outlen+extlen+1];
+    memcpy(out0path, outbase, outlen);
+    memcpy(out1path, outbase, outlen);
+
+    if(single_ended) strcpy(out0path+outlen, ".fa.gz");
     else {
-      printf(" seq error files: %s", flist->files[0]->path);
-      for(i = 1; i < num_profile_paths; i++)
-        printf(",%s", flist->files[i]->path);
-      printf("\n");
+      strcpy(out0path+outlen, ".1.fa.gz");
+      strcpy(out1path+outlen, ".2.fa.gz");
     }
-    total_seq += sim_reads(reffile, gzout0, gzout1, flist,
-                           insert, insert_stddev_prop*insert, rlen, depth);
-    seq_close(reffile);
+
+    gzFile gzout0 = NULL, gzout1 = NULL;
+    seq_file_t *sf0 = NULL, *sf1 = NULL, *reffile = NULL;
+    size_t total_seq = 0;
+
+    if(in0path != NULL && (sf0 = seq_open(in0path)) == NULL) die("Cannot read: %s", in0path);
+    if(in1path != NULL && (sf1 = seq_open(in1path)) == NULL) die("Cannot read: %s", in1path);
+
+    if(refpath != NULL)
+    {
+      if((reffile = seq_open(refpath)) == NULL) die("Cannot read: %s", refpath);
+      if((gzout0 = gzopen(out0path, "w")) == NULL) die("Cannot open: %s", out0path);
+      if(!single_ended && (gzout1 = gzopen(out1path, "w")) == NULL)
+        die("Cannot open: %s", out1path);
+    }
+
+    if(sf0 != NULL) {
+      printf("Adding error to input reads...\n");
+      total_seq += mutate_reads(sf0, gzout0, flist);
+      seq_close(sf0);
+    }
+    if(sf1 != NULL) {
+      total_seq += mutate_reads(sf1, single_ended ? gzout0 : gzout1, flist);
+      seq_close(sf1);
+    }
+
+    if(refpath != NULL)
+    {
+      printf("Sampling from %s\n", refpath);
+      printf(" read length: %i\n", rlen);
+      printf(" insert length: %i\n", insert);
+      printf(" insert stddev: %.2f * insert = %.2f\n",
+             insert_stddev_prop, insert_stddev_prop*insert);
+      printf(" sequencing depth: %.2f\n", depth);
+      printf(" read pairs: %s\n", single_ended ? "no" : "yes");
+      if(num_profile_paths == 0) printf(" sequencing errors: no\n");
+      else {
+        printf(" seq error files: %s", flist->files[0]->path);
+        for(i = 1; i < num_profile_paths; i++)
+          printf(",%s", flist->files[i]->path);
+        printf("\n");
+      }
+      total_seq += sim_reads(reffile, gzout0, gzout1, flist,
+                             insert, insert_stddev_prop*insert, rlen, depth);
+      seq_close(reffile);
+    }
+
+    if(gzout1 != NULL && gzout1 != NULL)
+      printf("Wrote %zu bases to: %s and %s\n", total_seq, out0path, out1path);
+    else if(gzout0 != NULL)
+      printf("Wrote %zu bases to: %s\n", total_seq, out0path);
+
+    if(gzout0 != NULL) gzclose(gzout0);
+    if(gzout1 != NULL) gzclose(gzout1);
   }
-
-  if(gzout1 != NULL && gzout1 != NULL)
-    printf("Wrote %zu bases to: %s and %s\n", total_seq, out0path, out1path);
-  else if(gzout0 != NULL)
-    printf("Wrote %zu bases to: %s\n", total_seq, out0path);
-
-  if(gzout0 != NULL) gzclose(gzout0);
-  if(gzout1 != NULL) gzclose(gzout1);
 
   if(flist != NULL)
   {
