@@ -9,6 +9,7 @@
 #include <math.h>
 #include <zlib.h>
 #include <time.h>
+#include <sys/time.h> // for seeding random
 
 #include "seq_file.h"
 
@@ -388,11 +389,19 @@ size_t sim_reads(seq_file_t *reffile, gzFile out0, gzFile out1,
   return num_bases;
 }
 
+static void seed_random()
+{
+  struct timeval time;
+  gettimeofday(&time, NULL);
+  srand((((time.tv_sec ^ getpid()) * 1000000) + time.tv_usec));
+}
+
 int main(int argc, char **argv)
 {
   if(argc < 3) print_usage(usage, NULL);
-  srand(time(NULL) + getpid());
 
+  // Set up
+  seed_random();
   init_qual_prob();
 
   // Sample reads from ref
