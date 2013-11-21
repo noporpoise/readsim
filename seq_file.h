@@ -10,7 +10,11 @@
 #include <limits.h>
 #include <zlib.h>
 
-// #define _USESAM
+// #define _USESAM 1
+
+#if defined(_USESAM) && _USESAM == 0
+#undef _USESAM
+#endif
 
 #ifdef _USESAM
   #include "hts.h"
@@ -454,7 +458,7 @@ static inline seq_file_t* seq_open2(const char *p, char sam_bam,
       exit(EXIT_FAILURE);
     }
     #ifdef _USESAM
-      if((sf->s_file = sam_open(p, sam_bam == 1 ? "rs" : "rb", 0)) == NULL) {
+      if((sf->s_file = sam_open(p, sam_bam == 1 ? "rs" : "rb")) == NULL) {
         free(sf->path);
         free(sf);
         return NULL;
@@ -501,7 +505,7 @@ static inline seq_file_t* seq_open_fh(FILE *fh, char sam_bam,
       exit(EXIT_FAILURE);
     }
     #ifdef _USESAM
-      if((sf->s_file = sam_open("-", sam_bam == 1 ? "rs" : "rb", 0)) == NULL) {
+      if((sf->s_file = sam_open("-", sam_bam == 1 ? "rs" : "rb")) == NULL) {
         free(sf);
         return NULL;
       }
