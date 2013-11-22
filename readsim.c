@@ -190,10 +190,10 @@ void filelist_mean_err(FileList *flist)
   for(i = 0; i < readcap; i++) { sumprob[i] = 0; counts[i] = 0; }
 
   read_t *r = &flist->read;
-  int fmt, fqoffset, minq, maxq;
+  int fmt, fqoffset = 33, minq, maxq;
   for(f = flist->curr; f < flist->num_files; f++) {
     fmt = seq_guess_fastq_format(flist->files[f], &minq, &maxq);
-    if(fmt != -1) fqoffset = FASTQ_OFFSET[fmt];
+    fqoffset = (fmt == -1 ? 33 : FASTQ_OFFSET[fmt]);
     while(seq_read(flist->files[f], r) > 0) {
       if(r->qual.end > readcap) {
         newcap = ROUNDUP2POW(r->qual.end);
