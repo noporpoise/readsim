@@ -13,7 +13,7 @@ else
 endif
 
 readsim: readsim.c seq_file.h stream_buffer.h
-	$(CC) -Wall -Wextra $(OPT) -o readsim $(HTSARGS) readsim.c $(LIBS)
+	$(CC) -Wall -Wextra $(OPT) -o readsim readsim.c $(HTSARGS) $(LIBS)
 
 plot: data/PhiX.1K.1.pdf
 
