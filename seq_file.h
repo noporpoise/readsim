@@ -1,3 +1,8 @@
+/*
+https://github.com/noporpoise/seq_file
+Isaac Turner <turner.isaac@gmail.com>
+Jan 2014, Public Domain
+*/
 
 #ifndef _SEQ_FILE_HEADER
 #define _SEQ_FILE_HEADER
@@ -43,12 +48,12 @@ struct seq_file_t
     samFile *s_file;
     bam_hdr_t *bam_header;
   #endif
-  int (*read)(seq_file_t *sf, read_t *r);
+  int (*readfunc)(seq_file_t *sf, read_t *r);
   buffer_t in;
   seqtype_t format;
   // Reads pushed onto a 'read stack' aka buffer
   read_t *rhead, *rtail; // 'unread' reads, add to tail, return from head
-  int (*origread)(seq_file_t *sf, read_t *r); // used when read = _seq_read_pop
+  int (*origreadfunc)(seq_file_t *sf, read_t *r); // used when read = _seq_read_pop
 };
 
 struct read_t
@@ -57,8 +62,8 @@ struct read_t
   #ifdef _USESAM
     bam1_t *bam;
   #endif
-  char from_sam; // from sam or bam
   read_t *next; // for use in a linked list
+  char from_sam; // from sam or bam
 };
 
 #define seq_is_bam(sf) ((sf)->format == IS_BAM)
@@ -74,7 +79,7 @@ struct read_t
 #define seq_get_path(sf) ((sf)->path)
 
 // return 1 on success, 0 on eof, -1 if partially read / syntax error
-#define seq_read(sf,r) ((sf)->read(sf,r))
+#define seq_read(sf,r) ((sf)->readfunc(sf,r))
 
 // File format information (http://en.wikipedia.org/wiki/FASTQ_format)
 static const char * const FASTQ_FORMATS[]
@@ -95,6 +100,12 @@ static const int FASTQ_OFFSET[6] = { 33, 33, 64, 64, 64, 33};
 // Create and destroy read structs
 //
 
+static inline void seq_read_reset(read_t *r) {
+  r->name.end = r->seq.end = r->qual.end = 0;
+  r->name.b[0] = r->seq.b[0] = r->qual.b[0] = '\0';
+  r->from_sam = 0;
+}
+
 static inline void seq_read_dealloc(read_t *r)
 {
   if(r->name.b != NULL) free(r->name.b);
@@ -107,6 +118,13 @@ static inline void seq_read_dealloc(read_t *r)
 
 static inline read_t* seq_read_alloc(read_t *r)
 {
+  r->name.b = r->seq.b = r->qual.b = NULL;
+  r->from_sam = 0;
+  r->next = NULL;
+  #ifdef _USESAM
+  r->bam = NULL;
+  #endif
+
   if(!buffer_init(&r->name, 256) ||
      !buffer_init(&r->seq, 256) ||
      !buffer_init(&r->qual, 256))
@@ -120,8 +138,10 @@ static inline read_t* seq_read_alloc(read_t *r)
       return NULL;
     }
   #endif
-  r->from_sam = 0;
-  r->next = NULL;
+  // buffer_init sets begin, end to 1, reset to 0
+  r->name.begin = r->seq.begin = r->qual.begin = 0;
+  seq_read_reset(r);
+
   return r;
 }
 
@@ -148,30 +168,30 @@ static const int8_t seq_comp_table[16] = { 0, 8, 4, 12, 2, 10, 9, 14,
 
 #ifdef _USESAM
 // Read a sam/bam file
-static inline int _seq_read_sam(seq_file_t *sf, read_t *read)
+static inline int _seq_read_sam(seq_file_t *sf, read_t *r)
 {
-  read->name.end = read->seq.end = read->qual.end = 0;
-  read->name.b[0] = read->seq.b[0] = read->qual.b[0] = '\0';
+  r->name.end = r->seq.end = r->qual.end = 0;
+  r->name.b[0] = r->seq.b[0] = r->qual.b[0] = '\0';
 
-  if(sam_read1(sf->s_file, sf->bam_header, read->bam) < 0) return 0;
+  if(sam_read1(sf->s_file, sf->bam_header, r->bam) < 0) return 0;
 
-  char *str = bam_get_qname(read->bam);
-  buffer_append_str(&read->name, str);
+  char *str = bam_get_qname(r->bam);
+  buffer_append_str(&r->name, str);
 
-  size_t qlen = read->bam->core.l_qseq;
-  buffer_ensure_capacity(&read->seq, qlen);
-  buffer_ensure_capacity(&read->qual, qlen);
-  uint8_t *bamseq = bam_get_seq(read->bam);
-  uint8_t *bamqual = bam_get_qual(read->bam);
+  size_t qlen = (size_t)r->bam->core.l_qseq;
+  buffer_ensure_capacity(&r->seq, qlen);
+  buffer_ensure_capacity(&r->qual, qlen);
+  uint8_t *bamseq = bam_get_seq(r->bam);
+  uint8_t *bamqual = bam_get_qual(r->bam);
 
   size_t i, j;
-  if(bam_is_rev(read->bam))
+  if(bam_is_rev(r->bam))
   {
     for(i = 0, j = qlen - 1; i < qlen; i++, j--)
     {
       int8_t b = bam_seqi(bamseq, j);
-      read->seq.b[i] = seq_nt16_str[seq_comp_table[b]];
-      read->qual.b[i] = 33 + bamqual[j];
+      r->seq.b[i] = seq_nt16_str[seq_comp_table[b]];
+      r->qual.b[i] = (char)(33 + bamqual[j]);
     }
   }
   else
@@ -179,73 +199,66 @@ static inline int _seq_read_sam(seq_file_t *sf, read_t *read)
     for(i = 0; i < qlen; i++)
     {
       int8_t b = bam_seqi(bamseq, i);
-      read->seq.b[i] = seq_nt16_str[b];
-      read->qual.b[i] = 33 + bamqual[i];
+      r->seq.b[i] = seq_nt16_str[b];
+      r->qual.b[i] = (char)(33 + bamqual[i]);
     }
   }
 
-  read->seq.end = read->qual.end = qlen;
-  read->seq.b[qlen] = read->qual.b[qlen] = 0;
-  read->from_sam = 1;
+  r->seq.end = r->qual.end = qlen;
+  r->seq.b[qlen] = r->qual.b[qlen] = 0;
+  r->from_sam = 1;
 
   return 1;
 }
 #endif /* _USESAM */
 
 
-#define _reset_read(sf,read) ({                                                \
-  read->name.end = read->seq.end = read->qual.end = 0;                         \
-  read->name.b[0] = read->seq.b[0] = read->qual.b[0] = '\0';                   \
-  read->from_sam = 0;                                                          \
-})
-
-
 #define _func_read_fastq(_read_fastq,__getc,__ungetc,__readline)               \
-  static inline int _read_fastq(seq_file_t *sf, read_t *read)                  \
+  static inline int _read_fastq(seq_file_t *sf, read_t *r)                     \
   {                                                                            \
     int c = __getc(sf);                                                        \
-    _reset_read(sf,read);                                                      \
+    seq_read_reset(r);                                                         \
                                                                                \
     if(c == -1) return 0;                                                      \
-    if(c != '@' || __readline(sf, read->name) == 0) return -1;                 \
-    buffer_chomp(&(read->name));                                               \
+    if(c != '@' || __readline(sf, r->name) == 0) return -1;                    \
+    buffer_chomp(&(r->name));                                                  \
                                                                                \
     while((c = __getc(sf)) != '+') {                                           \
       if(c == -1) return -1;                                                   \
       if(c != '\r' && c != '\n') {                                             \
-        buffer_append_char(&read->seq,c);                                      \
-        if(__readline(sf, read->seq) == 0) return -1;                          \
-        buffer_chomp(&(read->seq));                                            \
+        buffer_append_char(&r->seq,(char)c);                                   \
+        if(__readline(sf, r->seq) == 0) return -1;                             \
+        buffer_chomp(&(r->seq));                                               \
       }                                                                        \
     }                                                                          \
     while((c = __getc(sf)) != -1 && c != '\n');                                \
     if(c == -1) return -1;                                                     \
     do {                                                                       \
-      if(__readline(sf,read->qual) > 0) buffer_chomp(&(read->qual));           \
+      if(__readline(sf,r->qual) > 0) buffer_chomp(&(r->qual));                 \
       else return 1;                                                           \
-    } while(read->qual.end < read->seq.end);                                   \
+    } while(r->qual.end < r->seq.end);                                         \
     while((c = __getc(sf)) != -1 && c != '@');                                 \
     __ungetc(sf, c);                                                           \
     return 1;                                                                  \
   }
 
 #define _func_read_fasta(_read_fasta,__getc,__ungetc,__readline)               \
-  static inline int _read_fasta(seq_file_t *sf, read_t *read)                  \
+  static inline int _read_fasta(seq_file_t *sf, read_t *r)                     \
   {                                                                            \
     int c = __getc(sf);                                                        \
-    _reset_read(sf,read);                                                      \
+    seq_read_reset(r);                                                         \
                                                                                \
     if(c == -1) return 0;                                                      \
-    if(c != '>' || __readline(sf, read->name) == 0) return -1;                 \
-    buffer_chomp(&(read->name));                                               \
+    if(c != '>' || __readline(sf, r->name) == 0) return -1;                    \
+    buffer_chomp(&(r->name));                                                  \
                                                                                \
     while((c = __getc(sf)) != '>') {                                           \
       if(c == -1) return 1;                                                    \
       if(c != '\r' && c != '\n') {                                             \
-        buffer_append_char(&read->seq,c);                                      \
-        int r = __readline(sf, read->seq);                                     \
-        buffer_chomp(&(read->seq));                                            \
-        if(r <= 0) return 1;                                                   \
+        buffer_append_char(&r->seq,(char)c);                                   \
+        long nread = (long)__readline(sf, r->seq);                             \
+        buffer_chomp(&(r->seq));                                               \
+        if(nread <= 0) return 1;                                               \
       }                                                                        \
     }                                                                          \
     __ungetc(sf, c);                                                           \
@@ -254,69 +267,68 @@ static inline int _seq_read_sam(seq_file_t *sf, read_t *read)
 
 
 #define _func_read_plain(_read_plain,__getc,__readline,__skipline)             \
-  static inline int _read_plain(seq_file_t *sf, read_t *read)                  \
+  static inline int _read_plain(seq_file_t *sf, read_t *r)                     \
   {                                                                            \
     int c;                                                                     \
-    _reset_read(sf,read);                                                      \
+    seq_read_reset(r);                                                         \
     while((c = __getc(sf)) != -1 && isspace(c)) if(c != '\n') __skipline(sf);  \
     if(c == -1) return 0;                                                      \
-    buffer_append_char(&read->seq, c);                                         \
-    __readline(sf, read->seq);                                                 \
-    buffer_chomp(&(read->seq));                                                \
+    buffer_append_char(&r->seq, (char)c);                                      \
+    __readline(sf, r->seq);                                                    \
+    buffer_chomp(&(r->seq));                                                   \
     return 1;                                                                  \
   }
 
 #define _func_read_unknown(_read_unknown,__getc,__ungetc,__skipline,__fastq,__fasta,__plain)\
-  static inline int _read_unknown(seq_file_t *sf, read_t *read)                \
+  static inline int _read_unknown(seq_file_t *sf, read_t *r)                   \
   {                                                                            \
     int c;                                                                     \
-    _reset_read(sf, read);                                                     \
+    seq_read_reset(r);                                                         \
     while((c = __getc(sf)) != -1 && isspace(c)) if(c != '\n') __skipline(sf);  \
     if(c == -1) return 0;                                                      \
-    if(c == '@') { sf->format = IS_FASTQ; sf->origread = __fastq; }            \
-    else if(c == '>') { sf->format = IS_FASTA; sf->origread = __fasta; }       \
-    else { sf->format = IS_PLAIN; sf->origread = __plain; }                    \
+    if(c == '@') { sf->format = IS_FASTQ; sf->origreadfunc = __fastq; }        \
+    else if(c == '>') { sf->format = IS_FASTA; sf->origreadfunc = __fasta; }   \
+    else { sf->format = IS_PLAIN; sf->origreadfunc = __plain; }                \
     __ungetc(sf, c);                                                           \
-    return sf->origread(sf,read);                                              \
+    return sf->origreadfunc(sf,r);                                             \
   }
 
-#define _SF_SWAP(x,y,tmp) ({(tmp) = (x); (x) = (y); (y) = (tmp);})
+#define _SF_SWAP(x,y,tmp) do{ (tmp) = (x); (x) = (y); (y) = (tmp); } while(0)
 
+// Remove a read from the stack
 // Undefined behaviour if you have not previously called _seq_read_shift
-static inline int _seq_read_pop(seq_file_t *sf, read_t *read)
+static inline int _seq_read_pop(seq_file_t *sf, read_t *r)
 {
-  buffer_t tmp;
-  read_t *next = sf->rhead;
+  read_t tmp, *nxtread = sf->rhead;
   sf->rhead = sf->rhead->next;
-  _SF_SWAP(read->name, next->name, tmp);
-  _SF_SWAP(read->seq, next->seq, tmp);
-  _SF_SWAP(read->qual, next->qual, tmp);
-  seq_read_free(next);
+  _SF_SWAP(*r, *nxtread, tmp);
+  seq_read_free(nxtread);
   if(sf->rhead == NULL) {
-    sf->read = sf->origread;
+    sf->readfunc = sf->origreadfunc;
     sf->rtail = NULL;
   }
+  r->next = NULL;
   return 1;
 }
 
 // Add a read onto the read buffer (linked list FIFO)
-static inline void _seq_read_shift(seq_file_t *sf, read_t *read)
+static inline void _seq_read_shift(seq_file_t *sf, read_t *r)
 {
   if(sf->rhead == NULL) {
-    sf->read = _seq_read_pop;
-    sf->rhead = sf->rtail = read;
+    sf->readfunc = _seq_read_pop;
+    sf->rhead = sf->rtail = r;
   }
   else {
-    sf->rtail->next = read;
-    sf->rtail = read;
+    sf->rtail->next = r;
+    sf->rtail = r;
   }
-  read->next = NULL;
+  r->next = NULL;
 }
 
 // Load reads until we have at least nbases loaded or we hit EOF
 static inline void _seq_buffer_reads(seq_file_t *sf, size_t nbases)
 {
-  int (*read)(seq_file_t *sf, read_t *r) = sf->origread;
+  int (*readfunc)(seq_file_t *sf, read_t *r) = sf->origreadfunc;
 
   // Sum bases already in buffer
   read_t *r = sf->rhead;
@@ -328,7 +340,7 @@ static inline void _seq_buffer_reads(seq_file_t *sf, size_t nbases)
       fprintf(stderr, "[%s:%i] Error out of memory\n", __FILE__, __LINE__);
       break;
     }
-    if(read(sf,r) <= 0) { seq_read_free(r); break; }
+    if(readfunc(sf,r) <= 0) { seq_read_free(r); break; }
     currbases += r->seq.end;
     _seq_read_shift(sf, r);
   }
@@ -384,7 +396,6 @@ _func_read_unknown(_seq_read_unknown_gz,     _sf_gzgetc,     _sf_gzungetc,     _
 _func_read_unknown(_seq_read_unknown_f_buf,  _sf_fgetc_buf,  _sf_fungetc_buf,  _sf_fskipline,  _seq_read_fastq_f_buf,  _seq_read_fasta_f_buf,  _seq_read_plain_f_buf)
 _func_read_unknown(_seq_read_unknown_gz_buf, _sf_gzgetc_buf, _sf_gzungetc_buf, _sf_gzskipline, _seq_read_fastq_gz_buf, _seq_read_fasta_gz_buf, _seq_read_plain_gz_buf)
 
-
 static inline void _seq_file_init(seq_file_t *sf)
 {
   sf->gz_file = NULL;
@@ -403,17 +414,18 @@ static inline char _seq_setup(seq_file_t *sf, char use_zlib, size_t buf_size)
 {
   if(buf_size) {
     if(!buffer_init(&sf->in, buf_size)) { free(sf); return 0; }
-    sf->origread = use_zlib ? _seq_read_unknown_gz_buf : _seq_read_unknown_f_buf;
+    sf->origreadfunc = use_zlib ? _seq_read_unknown_gz_buf : _seq_read_unknown_f_buf;
   }
-  else sf->origread = use_zlib ? _seq_read_unknown_gz : _seq_read_unknown_f;
-  sf->read = sf->origread;
+  else sf->origreadfunc = use_zlib ? _seq_read_unknown_gz : _seq_read_unknown_f;
+  sf->readfunc = sf->origreadfunc;
   return 1;
 }
+
+#define _NUM_SEQ_EXT 28
 
 // Guess file type from file path or contents
 static inline seqtype_t seq_guess_filetype_from_extension(const char *path)
 {
-  #define _NUM_SEQ_EXT 28
   size_t plen = strlen(path);
   const char *exts[_NUM_SEQ_EXT]
     = {".fa", ".fasta", ".fsa", ".fsa.gz", "fsa.gzip", // FASTA
@@ -443,6 +455,8 @@ static inline seqtype_t seq_guess_filetype_from_extension(const char *path)
   return IS_UNKNOWN;
 }
 
+#undef _NUM_SEQ_EXT
+
 // sam_bam is 0 for not SAM/BAM, 1 for SAM, 2 for BAM
 static inline seq_file_t* seq_open2(const char *p, char sam_bam,
                                     char use_zlib, size_t buf_size)
@@ -464,7 +478,7 @@ static inline seq_file_t* seq_open2(const char *p, char sam_bam,
         return NULL;
       }
       sf->bam_header = sam_hdr_read(sf->s_file);
-      sf->read = sf->origread = _seq_read_sam;
+      sf->readfunc = sf->origreadfunc = _seq_read_sam;
       sf->format = sam_bam == 1 ? IS_SAM : IS_BAM;
     #else
       fprintf(stderr, "[%s:%i] Error: not compiled with sam/bam support\n",
@@ -510,7 +524,7 @@ static inline seq_file_t* seq_open_fh(FILE *fh, char sam_bam,
         return NULL;
       }
       sf->bam_header = sam_hdr_read(sf->s_file);
-      sf->read = sf->origread = _seq_read_sam;
+      sf->readfunc = sf->origreadfunc = _seq_read_sam;
     #else
       fprintf(stderr, "[%s:%i] Error: not compiled with sam/bam support\n",
               __FILE__, __LINE__);
@@ -543,6 +557,7 @@ static inline seq_file_t* seq_open(const char *p)
   return seq_open2(p, sam_bam, 1, DEFAULT_BUFSIZE);
 }
 
+// Close file handles, free resources
 static inline void seq_close(seq_file_t *sf)
 {
   if(sf->f_file != NULL) { fclose(sf->f_file); }
@@ -557,7 +572,7 @@ static inline void seq_close(seq_file_t *sf)
   free(sf);
 }
 
-// Get min and max quality values by examining the first 
+// Get min/max qual scores by reading sequences into buffer and reporting min/max
 // Returns 0 if no qual scores, 1 on success, -1 if read error
 static inline int seq_get_qual_limits(seq_file_t *sf, int *minq, int *maxq)
 {
@@ -614,7 +629,7 @@ static inline char _seq_read_looks_valid(read_t *r, const char *alphabet)
   if(r->qual.end != 0) {
     if(r->qual.end != r->seq.end) return 0;
     for(i = 0; i < r->seq.end; i++) {
-      char b = tolower(r->seq.b[i]);
+      char b = (char)tolower(r->seq.b[i]);
       char q = r->qual.b[i];
       if(strchr(alphabet, b) == NULL) return 0;
       if(q < 33 || q > 105) return 0;
@@ -622,7 +637,7 @@ static inline char _seq_read_looks_valid(read_t *r, const char *alphabet)
   }
   else {
     for(i = 0; i < r->seq.end; i++) {
-      char b = tolower(r->seq.b[i]);
+      char b = (char)tolower(r->seq.b[i]);
       if(strchr(alphabet, b) == NULL) return 0;
     }
   }
@@ -692,13 +707,13 @@ static inline size_t seq_read_truncate_name(read_t *r)
 static inline void seq_read_to_uppercase(read_t *r)
 {
   char *tmp;
-  for(tmp = r->seq.b; *tmp != '\0'; tmp++) *tmp = toupper(*tmp);
+  for(tmp = r->seq.b; *tmp != '\0'; tmp++) *tmp = (char)toupper(*tmp);
 }
 
 static inline void seq_read_to_lowercase(read_t *r)
 {
   char *tmp;
-  for(tmp = r->seq.b; *tmp != '\0'; tmp++) *tmp = tolower(*tmp);
+  for(tmp = r->seq.b; *tmp != '\0'; tmp++) *tmp = (char)tolower(*tmp);
 }
 
 #define _seq_print_wrap(fh,str,len,wrap,i,j,_putc) do { \
@@ -709,10 +724,10 @@ static inline void seq_read_to_lowercase(read_t *r)
   } while(0)
 
 #define _seq_print_fasta(fname,ftype,_printf,_putc)                            \
-  static inline void fname(const read_t *r, ftype fh, int linewrap) {          \
+  static inline void fname(const read_t *r, ftype fh, size_t linewrap) {       \
     if(linewrap == 0)  _printf(fh, ">%s\n%s\n", r->name.b, r->seq.b);          \
     else {                                                                     \
-      size_t i; int j;                                                         \
+      size_t i, j;                                                             \
       _printf(fh, ">%s\n", r->name.b);                                         \
       _seq_print_wrap(fh, r->seq.b, r->seq.end, linewrap, i, j, _putc);        \
       _putc(fh, '\n');                                                         \
@@ -723,10 +738,9 @@ _seq_print_fasta(seq_print_fasta,FILE*,fprintf,fputc2)
 _seq_print_fasta(seq_gzprint_fasta,gzFile,gzprintf,gzputc2)
 
 #define _seq_print_fastq(fname,ftype,_printf,_putc)                            \
-    static inline void fname(const read_t *r, ftype fh, int linewrap) {        \
-    size_t i, qlimit = (r->qual.end < r->seq.end ? r->qual.end : r->seq.end);  \
-    int j;                                                                     \
-    if(linewrap <= 0) {                                                        \
+  static inline void fname(const read_t *r, ftype fh, size_t linewrap) {       \
+    size_t i, j, qlimit = (r->qual.end < r->seq.end ? r->qual.end : r->seq.end);\
+    if(linewrap == 0) {                                                        \
       _printf(fh, "@%s\n%s\n+\n%.*s",r->name.b,r->seq.b,(int)qlimit,r->qual.b);\
       for(i = r->qual.end; i < r->seq.end; i++) { _putc(fh, '.'); }            \
       _putc(fh, '\n');                                                         \
@@ -747,6 +761,28 @@ _seq_print_fasta(seq_gzprint_fasta,gzFile,gzprintf,gzputc2)
 
 _seq_print_fastq(seq_print_fastq,FILE*,fprintf,fputc2)
 _seq_print_fastq(seq_gzprint_fastq,gzFile,gzprintf,gzputc2)
+
+#undef DEFAULT_BUFSIZE
+#undef _SF_SWAP
+#undef _sf_gzgetc
+#undef _sf_gzgetc_buf
+#undef _sf_fgetc
+#undef _sf_fgetc_buf
+#undef _sf_gzungetc
+#undef _sf_gzungetc_buf
+#undef _sf_fungetc
+#undef _sf_fungetc_buf
+#undef _sf_gzreadline
+#undef _sf_gzreadline_buf
+#undef _sf_freadline
+#undef _sf_freadline_buf
+#undef _sf_gzskipline
+#undef _sf_gzskipline_buf
+#undef _sf_fskipline
+#undef _sf_fskipline_buf
+#undef _seq_print_wrap
+#undef _seq_print_fasta
+#undef _seq_print_fastq
 
 // New read on the stack
 // read_t* seq_read_alloc(read_t*)
