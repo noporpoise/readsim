@@ -1,3 +1,11 @@
+/*
+ stream_buffer.c
+ project: string_buffer
+ url: https://github.com/noporpoise/StringBuffer
+ author: Isaac Turner <turner.isaac@gmail.com>
+ license: Public Domain
+ Jan 2014
+*/
 
 #ifndef _STREAM_BUFFER_HEADER
 #define _STREAM_BUFFER_HEADER
@@ -6,6 +14,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <zlib.h>
+#include <limits.h>
 
 typedef struct
 {
@@ -22,13 +31,21 @@ typedef struct
   #define ROUNDUP2POW(x) (0x1UL << (64 - __builtin_clzl(x)))
 #endif
 
+// Can't have a buffer larger than 2^32 because that's all that gzFile can read
 static inline char buffer_init(buffer_t *b, size_t s)
 {
+  if(s > UINT_MAX) { s = UINT_MAX; }
   b->size = s <= 4 ? 4 : ROUNDUP2POW(s);
   if((b->b = malloc(b->size)) == NULL) return 0;
   b->begin = b->end = 1;
-  b->b[b->size-1] = 0;
+  b->b[b->end] = b->b[b->size-1] = 0;
   return 1;
+}
+
+static inline void buffer_dealloc(buffer_t *b)
+{
+  if(b->b) free(b->b);
+  b->begin = b->end = b->size = 0;
 }
 
 static inline buffer_t* buffer_new(size_t s)
@@ -39,7 +56,7 @@ static inline buffer_t* buffer_new(size_t s)
   else { free(b); return NULL; } /* couldn't malloc */
 }
 
-#define buffer_free(buf) do{free((buf)->b); free(buf); } while(0)
+#define buffer_free(buf) do{ free((buf)->b); free(buf); } while(0)
 
 static inline void _ensure_capacity(char **buf, size_t *size, size_t len)
 {
@@ -58,7 +75,7 @@ static inline void buffer_ensure_capacity(buffer_t *buf, size_t s)
   _ensure_capacity(&buf->b, &buf->size, s);
 }
 
-static inline void buffer_append_str(buffer_t *buf, char *str)
+static inline void buffer_append_str(buffer_t *buf, const char *str)
 {
   size_t len = strlen(str);
   buffer_ensure_capacity(buf, buf->end+len);
@@ -77,13 +94,13 @@ static inline void buffer_append_char(buffer_t *buf, char c)
 #define buffer_terminate(buf) ((buf)->b[(buf)->end] = 0)
 
 // Beware: buffer_chomp only removes 1 end-of-line at a time
-#define buffer_chomp(buf) ({                                                   \
+#define buffer_chomp(buf) do {                                                 \
   if((buf)->end > 0 && (buf)->b[(buf)->end-1] == '\n') {                       \
     (buf)->end--;                                                              \
     if((buf)->end > 0 && (buf)->b[(buf)->end-1] == '\r') (buf)->end--;         \
     (buf)->b[(buf)->end] = 0;                                                  \
   }                                                                            \
-})
+} while(0)
 
 /* 
 Unbuffered
@@ -118,15 +135,16 @@ freadline(f,out)
   static inline size_t name(type_t file, char **buf, size_t *len, size_t *size)\
   {                                                                            \
     if(*len+1 >= *size) *buf = realloc(*buf, *size *= 2);                      \
-    size_t n, total_read = 0;                                                  \
-    while(__gets(file, *buf+*len, *size-*len) != NULL)                         \
+    /* Don't read more than 2^32 bytes at once (gzgets limit) */               \
+    size_t r = *size-*len > UINT_MAX ? UINT_MAX : *size-*len, origlen = *len;  \
+    while(__gets(file, *buf+*len, r) != NULL)                                  \
     {                                                                          \
-      n = strlen(*buf+*len);                                                   \
-      *len += n; total_read += n;                                              \
-      if((*buf)[*len-1] == '\n') return total_read;                            \
+      *len += strlen(*buf+*len);                                               \
+      if((*buf)[*len-1] == '\n') return *len-origlen;                          \
       else *buf = realloc(*buf, *size *= 2);                                   \
+      r = *size-*len > UINT_MAX ? UINT_MAX : *size-*len;                       \
     }                                                                          \
-    return total_read;                                                         \
+    return *len-origlen;                                                       \
   }
 
 _func_readline(gzreadline,gzFile,gzgets2)
@@ -164,11 +182,12 @@ freadline_buf(f,in,out)
 // both return -1 on error, 0 if nothing read, >0 on success
 // offset of 1 so we can unget at least one char
 // Beware: read-in buffer is not null-terminated
-#define _READ_BUFFER(file,in,__read,fail) ({                                   \
-  long _input = __read(file,(in)->b+1,(in)->size-1);                           \
+// Returns fail on error
+#define _READ_BUFFER(file,in,__read,fail) do{                                  \
+  long _input = (long)__read(file,(in)->b+1,(in)->size-1);                     \
   if(_input < 0) return fail;                                                  \
-  (in)->end = 1+_input; (in)->begin = 1;                                       \
-})
+  (in)->end = 1+(size_t)_input; (in)->begin = 1;                               \
+} while(0)
 
 // Define getc for gzFile and FILE (buffered)
 #define _func_getc_buf(fname,type_t,__read)                                    \
@@ -190,13 +209,13 @@ static inline int ungetc_buf(int c, buffer_t *in)
 {
   if(in->begin == 0) {
     if(in->end == 0) {
-      in->b[0] = c;
+      in->b[0] = (char)c;
       in->end = 1;
       return c;
     }
     else return -1;
   }
-  in->b[--(in->begin)] = c;
+  in->b[--(in->begin)] = (char)c;
   return c;
 }
 
@@ -208,15 +227,15 @@ static inline int ungetc_buf(int c, buffer_t *in)
   {                                                                            \
     if(in->begin >= in->end) { _READ_BUFFER(file,in,__read,-1); }              \
     size_t remaining = len, next;                                              \
-    while(in->end > in->begin && remaining > 0) {                             \
+    while(in->end > in->begin && remaining > 0) {                              \
       next = in->end - in->begin;                                              \
       if(remaining <= next) next = remaining;                                  \
       memcpy(ptr, in->b+in->begin, next);                                      \
-      in->begin += next; ptr += next;                                          \
+      in->begin += next; ptr = (char*)ptr + next;                              \
       if(remaining > next) { _READ_BUFFER(file,in,__read,-1); }                \
       remaining -= next;                                                       \
     }                                                                          \
-    return len - remaining;                                                    \
+    return (int)(len - remaining);                                             \
   }
 
 _func_read_buf(gzread_buf,gzFile,gzread2)
@@ -242,7 +261,7 @@ _func_read_buf(fread_buf,FILE*,fread2)
       _READ_BUFFER(file,in,__read,-1);                                         \
     }                                                                          \
     (*buf)[*len] = 0;                                                          \
-    return total_read;                                                         \
+    return (int)total_read;                                                    \
   }
 
 _func_readline_buf(gzreadline_buf,gzFile,gzread2)
@@ -262,7 +281,7 @@ _func_readline_buf(freadline_buf,FILE*,fread2)
       if(in->b[offset-1] == '\n') break;                                       \
       _READ_BUFFER(file,in,__read,-1);                                         \
     }                                                                          \
-    return skipped_bytes;                                                      \
+    return (int)skipped_bytes;                                                 \
   }
 
 _func_skipline_buf(gzskipline_buf,gzFile,gzread2)

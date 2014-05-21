@@ -12,6 +12,8 @@ else
 	OPT=-O2
 endif
 
+all: readsim
+
 readsim: readsim.c seq_file.h stream_buffer.h
 	$(CC) -Wall -Wextra $(OPT) -o readsim readsim.c $(HTSARGS) $(LIBS)
 
