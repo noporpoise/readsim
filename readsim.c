@@ -371,11 +371,11 @@ size_t sim_reads(seq_file_t *reffile, gzFile out0, gzFile out1,
       if(out1 != NULL)
         add_seq_error(read1, rlen, flist);
     }
-    gzprintf(out0, ">r%zu:0:%s:%zu:%zu\n%.*s\n", i, chroms[chr].name.b,
-                   pos0, pos1, (int)rlen, read0);
+    gzprintf(out0, ">r%zu:%s:%zu:%zu%s\n%.*s\n", i, chroms[chr].name.b,
+                   pos0, pos1, (out1 != NULL ? "/1" : ""), (int)rlen, read0);
     if(out1 != NULL) {
       dna_revcmp(read1, rlen);
-      gzprintf(out1, ">r%zu:1:%s:%zu:%zu\n%.*s\n", i, chroms[chr].name.b,
+      gzprintf(out1, ">r%zu:%s:%zu:%zu/2\n%.*s\n", i, chroms[chr].name.b,
                      pos0, pos1, (int)rlen, read1);
     }
   }
