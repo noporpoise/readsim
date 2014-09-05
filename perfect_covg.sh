@@ -12,4 +12,4 @@ then
 fi
 
 dnacat -P $2 | \
-  awk 'BEGIN{N='$1'} {print $0; for(i=1; i+N-1<=10; i++){ print substr($0,i,N) }}'
+  awk 'BEGIN{N='$1'} {l=length($0); for(i=1; i+N-1<=l; i++){ print substr($0,i,N) }}'
