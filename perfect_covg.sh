@@ -1,0 +1,15 @@
+#!/bin/bash
+
+# Simulate reads starting at every base, with a given read length
+# Requires dnacat (https://github.com/noporpoise/seq_file)
+
+set -euo pipefail
+
+if [[ $# -ne 2 || !( $1 =~ ^[0-9]+$ ) ]]
+then
+  echo "usage ./perfect_covg.sh <readlen> <ref.fa>"
+  exit -1
+fi
+
+dnacat -P $2 | \
+  awk 'BEGIN{N='$1'} {print $0; for(i=1; i+N-1<=10; i++){ print substr($0,i,N) }}'
