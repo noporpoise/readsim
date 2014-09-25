@@ -164,7 +164,7 @@ read_t* filelist_read(FileList *flist)
       char path[PATH_MAX+1];
       strcpy(path, flist->files[flist->curr]->path);
       seq_close(flist->files[flist->curr]);
-      seq_open(path);
+      flist->files[flist->curr] = seq_open(path);
     }
   }
   if(i > flist->num_files) die("All seq files empty");
@@ -496,7 +496,6 @@ int main(int argc, char **argv)
 
     gzFile gzout0 = NULL, gzout1 = NULL;
     seq_file_t *sf0 = NULL, *sf1 = NULL, *reffile = NULL;
-    size_t total_seq = 0;
 
     if(in0path != NULL && (sf0 = seq_open(in0path)) == NULL) die("Cannot read: %s", in0path);
     if(in1path != NULL && (sf1 = seq_open(in1path)) == NULL) die("Cannot read: %s", in1path);
@@ -554,7 +553,8 @@ int main(int argc, char **argv)
     // Print error distribution
     size_t err_total = 0;
     for(i = 0; i < flist->errors_len; i++) err_total += flist->errors[i];
-    printf("Errors: %zu (%.2f%%)\n", err_total, (100.0*err_total) / total_seq);
+    printf("Errors: %zu / %zu (%.2f%%)\n", err_total, total_seq,
+                                           (100.0*err_total) / total_seq);
     for(i = 0; i < flist->errors_len; i++) printf(" %zu", flist->errors[i]);
     printf("\n");
 
