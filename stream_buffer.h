@@ -62,8 +62,10 @@ static inline void buffer_free(CharBuffer *cbuf)
 }
 
 // Resize a void pointer
-static inline void vbuffer_ensure_capacity(char **vbuf, size_t *sizeptr, size_t len)
+// Adds one to len for NULL terminating byte
+static inline void cbuffer_ensure_capacity(char **vbuf, size_t *sizeptr, size_t len)
 {
+  len++; // for nul byte
   if(*sizeptr < len) {
     *sizeptr = ROUNDUP2POW(len);
     if((*vbuf = realloc(*vbuf, *sizeptr)) == NULL) {
@@ -73,11 +75,11 @@ static inline void vbuffer_ensure_capacity(char **vbuf, size_t *sizeptr, size_t 
   }
 }
 
-// size_t s is the number of bytes you want to be able to store
-// the actual buffer is created with s+1 bytes to allow for the \0
-static inline void buffer_ensure_capacity(CharBuffer *cbuf, size_t s)
+// len is the number of bytes you want to be able to store
+// Adds one to len for NULL terminating byte
+static inline void buffer_ensure_capacity(CharBuffer *cbuf, size_t len)
 {
-  vbuffer_ensure_capacity(&cbuf->b, &cbuf->size, s);
+  cbuffer_ensure_capacity(&cbuf->b, &cbuf->size, len);
 }
 
 static inline void buffer_append_str(CharBuffer *buf, const char *str)
@@ -258,10 +260,10 @@ _func_read_buf(fread_buf,FILE*,fread2)
     size_t offset, buffered, total_read = 0;                                   \
     while(in->end > in->begin)                                                 \
     {                                                                          \
-      for(offset = in->begin; offset < in->end && in->b[offset++] != '\n'; );  \
+      for(offset = in->begin; offset < in->end && in->b[offset++] != '\n'; ){} \
       buffered = offset - in->begin;                                           \
-      vbuffer_ensure_capacity(buf, size, *len+buffered);                       \
-      memcpy(*buf+*len, in->b+in->begin, buffered);                            \
+      cbuffer_ensure_capacity(buf, size, (*len)+buffered);                     \
+      memcpy((*buf)+(*len), in->b+in->begin, buffered);                        \
       *len += buffered;                                                        \
       in->begin = offset;                                                      \
       total_read += buffered;                                                  \
