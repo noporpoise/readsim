@@ -410,8 +410,8 @@ static void seed_random()
 {
   struct timeval time;
   gettimeofday(&time, NULL);
-  srand((((time.tv_sec*53) + getpid()) * 57) + time.tv_usec));
-  srand48((((time.tv_sec*53) + getpid()) * 57) + time.tv_usec));
+  srand((((time.tv_sec*53) + getpid()) * 57) + time.tv_usec);
+  srand48((((time.tv_sec*53) + getpid()) * 57) + time.tv_usec);
 }
 
 int main(int argc, char **argv)
