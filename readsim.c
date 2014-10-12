@@ -20,6 +20,7 @@ static const char usage[] =
 "\n"
 " Apply Error:\n"
 "  -p <profile.fq> apply errors with distribution as seen in profile.fq\n"
+"  -e <d>          sequencing error rate (0.0 -> 1.0) [0.0]\n"
 " Simulate reads:\n"
 "  -r <ref.fa>  sample reads from ref\n"
 // "  -t <t>       template size (insert size + 2*(read length)) [800]\n"
@@ -265,7 +266,7 @@ static inline char mut(char c, int i)
   return bases[b+i];
 }
 
-void add_seq_error(char *seq, size_t seqlen, FileList *flist)
+void add_seq_error_profile(char *seq, size_t seqlen, FileList *flist)
 {
   const read_t *r = filelist_read(flist);
   int fqoffset = flist->fqoffsets[flist->curr];
@@ -281,9 +282,21 @@ void add_seq_error(char *seq, size_t seqlen, FileList *flist)
   }
 }
 
+void add_seq_error_rate(char *seq, size_t len, float err)
+{
+  size_t i;
+  int rnd;
+  for(i = 0; i < len; i++) {
+    if(toupper(seq[i]) != 'N' && (rnd = rand()) < err * RAND_MAX) {
+      seq[i] = mut(seq[i], rnd % 3);
+      // flist->errors[i]++;
+    }
+  }
+}
+
 // Load reads from a file, apply sequence error, dump
 // Return total number of bases
-size_t mutate_reads(seq_file_t *sfile, gzFile gzout, FileList *flist)
+size_t mutate_reads(seq_file_t *sfile, gzFile gzout, FileList *flist, float err)
 {
   printf(" reading: %s\n", sfile->path);
   read_t r;
@@ -291,7 +304,8 @@ size_t mutate_reads(seq_file_t *sfile, gzFile gzout, FileList *flist)
   size_t num_bases = 0;
 
   while(seq_read(sfile, &r) > 0) {
-    add_seq_error(r.seq.b, r.seq.end, flist);
+    if(err > 0) add_seq_error_rate(r.seq.b, r.seq.end, err);
+    else add_seq_error_profile(r.seq.b, r.seq.end, flist);
     gzprintf(gzout, "@%s\n%s\n+\n%s\n", r.name.b, r.seq.b, r.qual.b);
     num_bases += r.seq.end;
   }
@@ -312,7 +326,7 @@ static size_t rand_chrom(read_t *chroms, size_t nchroms, size_t totallen)
 
 // Returns num of bases printed
 size_t sim_reads(seq_file_t *reffile, gzFile out0, gzFile out1,
-                 FileList *flist,
+                 FileList *flist, float err_rate,
                  size_t insert, double insert_stddev, size_t rlen, double depth)
 {
   size_t i, chromcap = 16, nchroms, glen = 0, nreads, chr, pos0, pos1, tlen;
@@ -367,9 +381,12 @@ size_t sim_reads(seq_file_t *reffile, gzFile out0, gzFile out1,
       memcpy(read1, chroms[chr].seq.b+pos1, rlen);
     }
     if(flist != NULL) {
-      add_seq_error(read0, rlen, flist);
+      add_seq_error_profile(read0, rlen, flist);
       if(out1 != NULL)
-        add_seq_error(read1, rlen, flist);
+        add_seq_error_profile(read1, rlen, flist);
+    }
+    else if(err_rate >= 0) {
+      add_seq_error_rate(read0, rlen, err_rate);
     }
     gzprintf(out0, ">r%zu:%s:%zu:%zu%s\n%.*s\n", i, chroms[chr].name.b,
                    pos0, pos1, (out1 != NULL ? "/1" : ""), (int)rlen, read0);
@@ -393,8 +410,8 @@ static void seed_random()
 {
   struct timeval time;
   gettimeofday(&time, NULL);
-  srand((((time.tv_sec ^ getpid()) * 1000001) + time.tv_usec));
-  srand48((((time.tv_sec ^ getpid()) * 1000003) + time.tv_usec));
+  srand((((time.tv_sec*53) + getpid()) * 57) + time.tv_usec));
+  srand48((((time.tv_sec*53) + getpid()) * 57) + time.tv_usec));
 }
 
 int main(int argc, char **argv)
@@ -416,9 +433,10 @@ int main(int argc, char **argv)
 
   char *profile_paths[argc];
   size_t num_profile_paths = 0, i, total_seq = 0;
+  float err_rate = -1;
 
   int c;
-  while((c = getopt(argc, argv, "p:r:i:v:l:d:s1:2:")) >= 0) {
+  while((c = getopt(argc, argv, "p:r:i:v:l:d:s1:2:e:")) >= 0) {
     switch (c) {
       case 'p': profile_paths[num_profile_paths++] = optarg; break;
       case 'r': refpath = optarg; optr++; break;
@@ -431,6 +449,7 @@ int main(int argc, char **argv)
       case 's': single_ended = 1; break;
       case '1': in0path = optarg; break;
       case '2': in1path = optarg; break;
+      case 'e': err_rate = atof(optarg); break;
       default: die("Unknown option: %c", c);
     }
   }
@@ -468,6 +487,9 @@ int main(int argc, char **argv)
 
   if(num_profile_paths == 0 && outbase == NULL)
     print_usage(usage, "More options required");
+
+  if(num_profile_paths > 0 && err_rate >= 0)
+    print_usage(usage, "Cannot use both -p and -E");
 
   // Profile reads
   FileList fliststore, *flist = NULL;
@@ -510,31 +532,36 @@ int main(int argc, char **argv)
 
     if(sf0 != NULL) {
       printf("Adding error to input reads...\n");
-      total_seq += mutate_reads(sf0, gzout0, flist);
+      total_seq += mutate_reads(sf0, gzout0, flist, err_rate);
       seq_close(sf0);
     }
     if(sf1 != NULL) {
-      total_seq += mutate_reads(sf1, single_ended ? gzout0 : gzout1, flist);
+      total_seq += mutate_reads(sf1, single_ended ? gzout0 : gzout1, flist, err_rate);
       seq_close(sf1);
     }
 
     if(refpath != NULL)
     {
       printf("Sampling from %s\n", refpath);
-      printf(" read length: %i\n", rlen);
-      printf(" insert length: %i\n", insert);
-      printf(" insert stddev: %.2f * insert = %.2f\n",
-             insert_stddev_prop, insert_stddev_prop*insert);
       printf(" sequencing depth: %.2f\n", depth);
+      printf(" read length: %i\n", rlen);
       printf(" read pairs: %s\n", single_ended ? "no" : "yes");
-      if(num_profile_paths == 0) printf(" sequencing errors: no\n");
-      else {
+      if(!single_ended) {
+        printf(" insert length: %i\n", insert);
+        printf(" insert stddev: %.2f * insert = %.2f\n",
+               insert_stddev_prop, insert_stddev_prop*insert);
+      }
+      if(num_profile_paths > 0) {
         printf(" seq error files: %s", flist->files[0]->path);
         for(i = 1; i < num_profile_paths; i++)
           printf(",%s", flist->files[i]->path);
         printf("\n");
+      } else if(err_rate >= 0) {
+        printf(" seq error rate: %.2f%%\n", err_rate * 100.0);
+      } else {
+        printf(" sequencing errors: no\n");
       }
-      total_seq += sim_reads(reffile, gzout0, gzout1, flist,
+      total_seq += sim_reads(reffile, gzout0, gzout1, flist, err_rate,
                              insert, insert_stddev_prop*insert, rlen, depth);
       seq_close(reffile);
     }
