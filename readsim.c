@@ -31,7 +31,9 @@ static const char usage[] =
 "  -d <d>       sequencing depth [1]\n"
 " Load reads:\n"
 "  -1 <in.1.fq> input reads\n"
-"  -2 <in.2.fq> input reads\n";
+"  -2 <in.2.fq> input reads\n"
+" Other arguments:\n"
+"  -g <g>       seed for random number generator [auto]\n";
 
 #define MAX2(x,y) ((x) >= (y) ? (x) : (y))
 #define MIN2(x,y) ((x) <= (y) ? (x) : (y))
@@ -407,21 +409,22 @@ size_t sim_reads(seq_file_t *reffile, gzFile out0, gzFile out1,
   return num_bases;
 }
 
-static void seed_random()
+static void seed_random(uint64_t seed)
+{
+  srand(seed);
+  srand48(seed);
+}
+
+static uint64_t generate_seed()
 {
   struct timeval time;
   gettimeofday(&time, NULL);
-  srand((((time.tv_sec*53) + getpid()) * 57) + time.tv_usec);
-  srand48((((time.tv_sec*53) + getpid()) * 57) + time.tv_usec);
+  return (((time.tv_sec*53) + getpid()) * 57) + time.tv_usec;
 }
 
 int main(int argc, char **argv)
 {
   if(argc < 3) print_usage(usage, NULL);
-
-  // Set up
-  seed_random();
-  init_qual_prob();
 
   // Sample reads from ref
   char *refpath = NULL;
@@ -429,6 +432,7 @@ int main(int argc, char **argv)
   int insert = 250, rlen = 250, single_ended = 0;
   double depth = 1.0, insert_stddev_prop = 0.2; // stddev as proportion of insert
   int optr = 0, opti = 0, optv = 0, optl = 0, optd = 0; // keeps track of values
+  uint64_t seed = generate_seed(); // default RNG seed
 
   char *in0path = NULL, *in1path = NULL;
 
@@ -437,7 +441,7 @@ int main(int argc, char **argv)
   float err_rate = -1;
 
   int c;
-  while((c = getopt(argc, argv, "p:r:i:v:l:d:s1:2:e:")) >= 0) {
+  while((c = getopt(argc, argv, "p:r:i:v:l:d:s1:2:e:g:")) >= 0) {
     switch (c) {
       case 'p': profile_paths[num_profile_paths++] = optarg; break;
       case 'r': refpath = optarg; optr++; break;
@@ -451,9 +455,14 @@ int main(int argc, char **argv)
       case '1': in0path = optarg; break;
       case '2': in1path = optarg; break;
       case 'e': err_rate = atof(optarg); break;
+      case 'g': seed = atoi(optarg); break;
       default: die("Unknown option: %c", c);
     }
   }
+
+  // Set up
+  seed_random(seed);
+  init_qual_prob();
 
   char *outbase = NULL;
 
