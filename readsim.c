@@ -302,11 +302,12 @@ size_t mutate_reads(seq_file_t *sfile, gzFile gzout, FileList *flist)
 
 static size_t rand_chrom(read_t *chroms, size_t nchroms, size_t totallen)
 {
-  uint64_t i, r = (((uint64_t)rand()) << 32) | rand();
+  uint64_t i, r = (((uint64_t)rand()) << 32) | rand(), sum = 0;
   r %= totallen;
-  for(i = 0; i < nchroms; i++)
-    if(r < chroms[i].seq.end)
-      return i;
+  for(i = 0; i < nchroms; i++) {
+    sum += chroms[i].seq.end;
+    if(sum > r) return i;
+  }
   die("Shouldn't reach here");
 }
 

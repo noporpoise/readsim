@@ -4,7 +4,7 @@
  url: https://github.com/noporpoise/StringBuffer
  author: Isaac Turner <turner.isaac@gmail.com>
  license: Public Domain
- Jan 2014
+ Jan 2015
 */
 
 #ifndef _STREAM_BUFFER_HEADER
@@ -22,7 +22,7 @@ typedef struct
   // begin is index of first char (unless begin >= end)
   // end is index of \0
   // size should be >= end+1 to allow for \0
-  // (end-size) is the number of bytes in buffer
+  // (end-begin) is the number of bytes in buffer
   size_t begin, end, size;
 } CharBuffer;
 
@@ -100,14 +100,21 @@ static inline void buffer_append_char(CharBuffer *buf, char c)
 
 #define buffer_terminate(buf) ((buf)->b[(buf)->end] = 0)
 
-// Beware: buffer_chomp only removes 1 end-of-line at a time
-#define buffer_chomp(buf) do {                                                 \
-  if((buf)->end > 0 && (buf)->b[(buf)->end-1] == '\n') {                       \
-    (buf)->end--;                                                              \
-    if((buf)->end > 0 && (buf)->b[(buf)->end-1] == '\r') (buf)->end--;         \
-    (buf)->b[(buf)->end] = 0;                                                  \
-  }                                                                            \
+#define buffer_reset(buf) do { \
+  (buf)->begin = (buf)->end = 1; (buf)->b[1] = 0; \
 } while(0)
+
+#define buffer_len(buf) ((buf)->end - (buf)->begin)
+
+static inline void buffer_chomp(CharBuffer *buf)
+{
+  while(buf->end > buf->begin &&
+        (buf->b[buf->end-1] == '\n' || buf->b[buf->end-1] == '\r'))
+  {
+    buf->end--;
+  }
+  buf->b[buf->end] = 0;
+}
 
 /* 
 Unbuffered
@@ -141,7 +148,7 @@ freadline(f,out)
 #define _func_readline(name,type_t,__gets) \
   static inline size_t name(type_t file, char **buf, size_t *len, size_t *size)\
   {                                                                            \
-    if(*len+1 >= *size) *buf = realloc(*buf, *size *= 2);                      \
+    if(*len+1 >= *size) cbuffer_ensure_capacity(buf, size, *len+1);            \
     /* Don't read more than 2^32 bytes at once (gzgets limit) */               \
     size_t r = *size-*len > UINT_MAX ? UINT_MAX : *size-*len, origlen = *len;  \
     while(__gets(file, *buf+*len, r) != NULL)                                  \
