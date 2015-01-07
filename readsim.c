@@ -316,14 +316,33 @@ size_t mutate_reads(seq_file_t *sfile, gzFile gzout, FileList *flist, float err)
   return num_bases;
 }
 
+// Random uniform integer in range [0,n) (0 <= x < n) without modulo bias
+// Does this by discarding some random numbers
+static inline uint64_t random_uniform(uint64_t n)
+{
+  // RAND_MAX is of unknown size, assume at least 28 bits.
+  // Make a big rand with BIG_RAND_MAX = 2*28 = 56 bits => likely plenty
+  #define BIG_RAND_MAX 0xfffffffffffffful
+  const size_t limit = BIG_RAND_MAX - (BIG_RAND_MAX % n);
+  size_t r;
+
+  do {
+    r = ((rand() & 0xffffffful)      ) |
+        ((rand() & 0xffffffful) << 28);
+  } while(r >= limit);
+
+  return r % n;
+}
+
 static size_t rand_chrom(read_t *chroms, size_t nchroms, size_t totallen)
 {
-  uint64_t i, r = (((uint64_t)rand()) << 32) | rand(), sum = 0;
-  r %= totallen;
+  uint64_t i, r = random_uniform(totallen), sum = 0;
+
   for(i = 0; i < nchroms; i++) {
     sum += chroms[i].seq.end;
-    if(sum > r) return i;
+    if(r < sum) return i;
   }
+
   die("Shouldn't reach here");
 }
 
@@ -375,7 +394,7 @@ size_t sim_reads(seq_file_t *reffile, gzFile out0, gzFile out1,
   for(i = 0; i < nreads; i++)
   {
     chr = (nchroms == 1) ? 0 : rand_chrom(chroms, nchroms, glen);
-    pos0 = drand48() * (chroms[chr].seq.end - (out1 == NULL ? rlen : tlen));
+    pos0 = random_uniform(chroms[chr].seq.end - (out1 == NULL ? rlen : tlen));
     pos1 = pos0;
     memcpy(read0, chroms[chr].seq.b+pos0, rlen);
     if(out1 != NULL) {
