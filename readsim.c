@@ -135,6 +135,7 @@ void filelist_alloc(FileList *flist, char **paths, size_t num)
       die("Cannot open: %s", paths[i]);
     int min, max, fmt;
     fmt = seq_guess_fastq_format(flist->files[i], &min, &max);
+    if(fmt < 0) die("Cannot detect FASTQ format: %s", paths[i]);
     flist->fqoffsets[i] = FASTQ_OFFSET[fmt];
     printf(" profile: %s [offset: %i]\n", paths[i], FASTQ_OFFSET[fmt]);
   }
@@ -241,7 +242,7 @@ static inline char dna_complement(char c)
   die("Invalid base: '%c'", c);
 }
 
-static void dna_revcmp(char *dna, size_t len)
+static inline void dna_revcmp(char *dna, size_t len)
 {
   if(len == 0) return;
   if(len == 1) { dna[0] = dna_complement(dna[0]); return; }
