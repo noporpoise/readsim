@@ -167,6 +167,7 @@ read_t* filelist_read(FileList *flist)
     if(flist->curr == flist->num_files) { flist->curr = flist->filesready = 0; }
     if(!flist->filesready) {
       char path[PATH_MAX+1];
+      assert(strlen(flist->files[flist->curr]->path) <= PATH_MAX);
       strcpy(path, flist->files[flist->curr]->path);
       seq_close(flist->files[flist->curr]);
       flist->files[flist->curr] = seq_open(path);
@@ -597,7 +598,7 @@ int main(int argc, char **argv)
       seq_close(reffile);
     }
 
-    if(gzout1 != NULL && gzout1 != NULL)
+    if(gzout0 != NULL && gzout1 != NULL)
       printf("Wrote %zu bases to: %s and %s\n", total_seq, out0path, out1path);
     else if(gzout0 != NULL)
       printf("Wrote %zu bases to: %s\n", total_seq, out0path);
