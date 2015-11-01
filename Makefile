@@ -1,5 +1,5 @@
 ifdef HTSLIB
-	HTSARGS=-I $(HTSLIB)/htslib -D_USESAM=1 $(HTSLIB)/libhts.a
+	HTSARGS=-I $(HTSLIB) -D_USESAM=1 $(HTSLIB)/libhts.a
 	LIBS=-lpthread -lz -lm
 else
 	HTSARGS=
