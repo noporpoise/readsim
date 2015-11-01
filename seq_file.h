@@ -1,7 +1,7 @@
 /*
 https://github.com/noporpoise/seq_file
 Isaac Turner <turner.isaac@gmail.com>
-Jan 2014, Public Domain
+Sep 2015, Public Domain
 */
 
 #ifndef _SEQ_FILE_HEADER
@@ -11,6 +11,7 @@ Jan 2014, Public Domain
 #include <stdio.h>
 #include <string.h>
 #include <strings.h> // strcasecmp
+#include <stdbool.h>
 #include <ctype.h>
 #include <limits.h>
 #include <zlib.h>
@@ -23,8 +24,9 @@ Jan 2014, Public Domain
 #endif
 
 #ifdef _USESAM
-  #include "hts.h"
-  #include "sam.h"
+#include "htslib/hfile.h"
+#include "htslib/hts.h"
+#include "htslib/sam.h"
 #endif
 
 #include "stream_buffer.h"
@@ -44,27 +46,39 @@ struct seq_file_struct
   char *path;
   FILE *f_file;
   gzFile gz_file;
-  #ifdef _USESAM
-    samFile *s_file;
-    bam_hdr_t *bam_header;
-  #endif
+  void *hts_file; // cast to (htsFile*)
+  void *bam_hdr; // cast to (bam_hdr_t*)
+
   int (*readfunc)(seq_file_t *sf, read_t *r);
   StreamBuffer in;
   seq_format format;
+
   // Reads pushed onto a 'read stack' aka buffer
   read_t *rhead, *rtail; // 'unread' reads, add to tail, return from head
   int (*origreadfunc)(seq_file_t *sf, read_t *r); // used when read = _seq_read_pop
 };
 
+typedef struct {
+  char *b;
+  size_t end, size;
+} seq_buf_t;
+
 struct read_struct
 {
-  StreamBuffer name, seq, qual;
-  #ifdef _USESAM
-    bam1_t *bam;
-  #endif
+  seq_buf_t name, seq, qual;
+  void *bam; // cast to (bam1_t*) get/set with seq_read_bam()
   read_t *next; // for use in a linked list
-  char from_sam; // from sam or bam
+  bool from_sam; // from sam or bam
 };
+
+#define seq_read_init {.name = {.b = NULL, .end = 0, .size = 0}, \
+                       .seq  = {.b = NULL, .end = 0, .size = 0}, \
+                       .qual = {.b = NULL, .end = 0, .size = 0}, \
+                       .bam = NULL, .next = NULL, .from_sam = false}
+
+#ifdef _USESAM
+  #define seq_read_bam(r) ((bam1_t*)(r)->bam)
+#endif
 
 #define seq_is_bam(sf) ((sf)->format == SEQ_FMT_BAM)
 #define seq_is_sam(sf) ((sf)->format == SEQ_FMT_SAM)
@@ -80,6 +94,23 @@ struct read_struct
 
 // return 1 on success, 0 on eof, -1 if partially read / syntax error
 #define seq_read(sf,r) ((sf)->readfunc(sf,r))
+
+/**
+ * Fetch a read that is not a secondary or supplementary alignment
+ */
+static inline int seq_read_primary(seq_file_t *sf, read_t *r)
+{
+  int s = seq_read(sf, r);
+#ifdef _USESAM
+  if(s > 0 && r->from_sam) {
+    while(s > 0 && seq_read_bam(r)->core.flag & (BAM_FSECONDARY|BAM_FSUPPLEMENTARY))
+      s = seq_read(sf, r);
+  }
+#endif
+  return s;
+}
+
+static inline void seq_close(seq_file_t *sf);
 
 // File format information (http://en.wikipedia.org/wiki/FASTQ_format)
 static const char * const FASTQ_FORMATS[]
@@ -101,35 +132,32 @@ static const int FASTQ_OFFSET[6] = { 33, 33, 64, 64, 64, 33};
 //
 
 static inline void seq_read_reset(read_t *r) {
-  r->name.begin = r->seq.begin = r->qual.begin = 0;
   r->name.end = r->seq.end = r->qual.end = 0;
   r->name.b[0] = r->seq.b[0] = r->qual.b[0] = '\0';
-  r->from_sam = 0;
+  r->from_sam = false;
 }
 
 static inline void seq_read_dealloc(read_t *r)
 {
-  strm_buf_dealloc(&r->name);
-  strm_buf_dealloc(&r->seq);
-  strm_buf_dealloc(&r->qual);
+  free(r->name.b);
+  free(r->seq.b);
+  free(r->qual.b);
   #ifdef _USESAM
-    free(r->bam);
+    bam_destroy1(r->bam);
   #endif
   memset(r, 0, sizeof(read_t));
 }
 
 static inline read_t* seq_read_alloc(read_t *r)
 {
-  r->name.b = r->seq.b = r->qual.b = NULL;
-  r->from_sam = 0;
-  r->next = NULL;
-  #ifdef _USESAM
-  r->bam = NULL;
-  #endif
+  memset(r, 0, sizeof(read_t));
 
-  if(!strm_buf_alloc(&r->name, 256) ||
-     !strm_buf_alloc(&r->seq,  256) ||
-     !strm_buf_alloc(&r->qual, 256))
+  r->name.b = malloc(256);
+  r->seq.b  = malloc(256);
+  r->qual.b = malloc(256);
+  r->name.size = r->seq.size = r->qual.size = 256;
+
+  if(!r->name.b || !r->seq.b || !r->qual.b)
   {
     seq_read_dealloc(r);
     return NULL;
@@ -140,9 +168,6 @@ static inline read_t* seq_read_alloc(read_t *r)
       return NULL;
     }
   #endif
-
-  // strm_buf_alloc sets begin, end to 1, reset to 0
-  seq_read_reset(r);
 
   return r;
 }
@@ -172,28 +197,28 @@ static const int8_t seq_comp_table[16] = { 0, 8, 4, 12, 2, 10, 9, 14,
 // Read a sam/bam file
 static inline int _seq_read_sam(seq_file_t *sf, read_t *r)
 {
-  r->name.begin = r->seq.begin = r->qual.begin = 0;
   r->name.end = r->seq.end = r->qual.end = 0;
   r->name.b[0] = r->seq.b[0] = r->qual.b[0] = '\0';
 
-  if(sam_read1(sf->s_file, sf->bam_header, r->bam) < 0) return 0;
+  if(sam_read1(sf->hts_file, sf->bam_hdr, r->bam) < 0) return 0;
 
-  char *str = bam_get_qname(r->bam);
-  strm_buf_append_str(&r->name, str);
+  const bam1_t *b = seq_read_bam(r);
+  char *str = bam_get_qname(b);
+  cbuf_append_str(&r->name.b, &r->name.end, &r->name.size, str, strlen(str));
 
-  size_t qlen = (size_t)r->bam->core.l_qseq;
-  strm_buf_ensure_capacity(&r->seq, qlen);
-  strm_buf_ensure_capacity(&r->qual, qlen);
-  uint8_t *bamseq = bam_get_seq(r->bam);
-  uint8_t *bamqual = bam_get_qual(r->bam);
+  size_t qlen = (size_t)b->core.l_qseq;
+  cbuf_capacity(&r->seq.b, &r->seq.end, qlen);
+  cbuf_capacity(&r->qual.b, &r->qual.end, qlen);
+  const uint8_t *bamseq = bam_get_seq(b);
+  const uint8_t *bamqual = bam_get_qual(b);
 
   size_t i, j;
-  if(bam_is_rev(r->bam))
+  if(bam_is_rev(b))
   {
     for(i = 0, j = qlen - 1; i < qlen; i++, j--)
     {
-      int8_t b = bam_seqi(bamseq, j);
-      r->seq.b[i] = seq_nt16_str[seq_comp_table[b]];
+      int8_t c = bam_seqi(bamseq, j);
+      r->seq.b[i] = seq_nt16_str[seq_comp_table[c]];
       r->qual.b[i] = (char)(33 + bamqual[j]);
     }
   }
@@ -201,15 +226,15 @@ static inline int _seq_read_sam(seq_file_t *sf, read_t *r)
   {
     for(i = 0; i < qlen; i++)
     {
-      int8_t b = bam_seqi(bamseq, i);
-      r->seq.b[i] = seq_nt16_str[b];
+      int8_t c = bam_seqi(bamseq, i);
+      r->seq.b[i] = seq_nt16_str[c];
       r->qual.b[i] = (char)(33 + bamqual[i]);
     }
   }
 
   r->seq.end = r->qual.end = qlen;
-  r->seq.b[qlen] = r->qual.b[qlen] = 0;
-  r->from_sam = 1;
+  r->seq.b[qlen] = r->qual.b[qlen] = '\0';
+  r->from_sam = true;
 
   return 1;
 }
@@ -224,20 +249,20 @@ static inline int _seq_read_sam(seq_file_t *sf, read_t *r)
                                                                                \
     if(c == -1) return 0;                                                      \
     if(c != '@' || __readline(sf, r->name) == 0) return -1;                    \
-    strm_buf_chomp(&(r->name));                                                \
+    cbuf_chomp(r->name.b, &r->name.end);                                       \
                                                                                \
     while((c = __getc(sf)) != '+') {                                           \
       if(c == -1) return -1;                                                   \
       if(c != '\r' && c != '\n') {                                             \
-        strm_buf_append_char(&r->seq,(char)c);                                 \
+        cbuf_append_char(&r->seq.b, &r->seq.end, &r->seq.size, (char)c);       \
         if(__readline(sf, r->seq) == 0) return -1;                             \
-        strm_buf_chomp(&(r->seq));                                             \
+        cbuf_chomp(r->seq.b, &r->seq.end);                                     \
       }                                                                        \
     }                                                                          \
     while((c = __getc(sf)) != -1 && c != '\n');                                \
     if(c == -1) return -1;                                                     \
     do {                                                                       \
-      if(__readline(sf,r->qual) > 0) strm_buf_chomp(&(r->qual));               \
+      if(__readline(sf,r->qual) > 0) cbuf_chomp(r->qual.b, &r->qual.end);      \
       else return 1;                                                           \
     } while(r->qual.end < r->seq.end);                                         \
     while((c = __getc(sf)) != -1 && c != '@');                                 \
@@ -253,14 +278,14 @@ static inline int _seq_read_sam(seq_file_t *sf, read_t *r)
                                                                                \
     if(c == -1) return 0;                                                      \
     if(c != '>' || __readline(sf, r->name) == 0) return -1;                    \
-    strm_buf_chomp(&(r->name));                                                \
+    cbuf_chomp(r->name.b, &r->name.end);                                       \
                                                                                \
     while((c = __getc(sf)) != '>') {                                           \
       if(c == -1) return 1;                                                    \
       if(c != '\r' && c != '\n') {                                             \
-        strm_buf_append_char(&r->seq,(char)c);                                 \
+        cbuf_append_char(&r->seq.b, &r->seq.end, &r->seq.size, (char)c);       \
         long nread = (long)__readline(sf, r->seq);                             \
-        strm_buf_chomp(&(r->seq));                                             \
+        cbuf_chomp(r->seq.b, &r->seq.end);                                     \
         if(nread <= 0) return 1;                                               \
       }                                                                        \
     }                                                                          \
@@ -276,9 +301,9 @@ static inline int _seq_read_sam(seq_file_t *sf, read_t *r)
     seq_read_reset(r);                                                         \
     while((c = __getc(sf)) != -1 && isspace(c)) if(c != '\n') __skipline(sf);  \
     if(c == -1) return 0;                                                      \
-    strm_buf_append_char(&r->seq, (char)c);                                    \
+    cbuf_append_char(&r->seq.b, &r->seq.end, &r->seq.size, (char)c);           \
     __readline(sf, r->seq);                                                    \
-    strm_buf_chomp(&(r->seq));                                                 \
+    cbuf_chomp(r->seq.b, &r->seq.end);                                         \
     return 1;                                                                  \
   }
 
@@ -401,7 +426,7 @@ _func_read_unknown(_seq_read_unknown_f_buf,  _sf_fgetc_buf,  _sf_fungetc_buf,  _
 _func_read_unknown(_seq_read_unknown_gz_buf, _sf_gzgetc_buf, _sf_gzungetc_buf, _sf_gzskipline, _seq_read_fastq_gz_buf, _seq_read_fasta_gz_buf, _seq_read_plain_gz_buf)
 
 // Returns 1 on success 0 if out of memory
-static inline char _seq_setup(seq_file_t *sf, char use_zlib, size_t buf_size)
+static inline char _seq_setup(seq_file_t *sf, bool use_zlib, size_t buf_size)
 {
   if(buf_size) {
     if(!strm_buf_alloc(&sf->in, buf_size)) { free(sf); return 0; }
@@ -450,28 +475,30 @@ static inline seq_format seq_guess_filetype_from_extension(const char *path)
 
 #undef NUM_SEQ_EXT
 
-// sam_bam is 0 for not SAM/BAM, 1 for SAM, 2 for BAM
-static inline seq_file_t* seq_open2(const char *p, char sam_bam,
-                                    char use_zlib, size_t buf_size)
+static inline seq_file_t* seq_open2(const char *p, bool issam,
+                                    bool use_zlib, size_t buf_size)
 {
   seq_file_t *sf = calloc(1, sizeof(seq_file_t));
+  sf->path = strdup(p);
 
-  if(sam_bam)
+  if(issam)
   {
-    if(sam_bam != 1 && sam_bam != 2) {
-      fprintf(stderr, "[%s:%i] Error: sum_bam param must be 0, 1 (sam) or 2 (bam)\n",
-              __FILE__, __LINE__);
-      exit(EXIT_FAILURE);
-    }
     #ifdef _USESAM
-      if((sf->s_file = sam_open(p, sam_bam == 1 ? "rs" : "rb")) == NULL) {
-        free(sf->path);
-        free(sf);
+      if((sf->hts_file = hts_open(p, "r")) == NULL) {
+        seq_close(sf);
         return NULL;
       }
-      sf->bam_header = sam_hdr_read(sf->s_file);
+      sf->bam_hdr = sam_hdr_read(sf->hts_file);
       sf->readfunc = sf->origreadfunc = _seq_read_sam;
-      sf->format = sam_bam == 1 ? SEQ_FMT_SAM : SEQ_FMT_BAM;
+
+      const htsFormat *hts_fmt = hts_get_format(sf->hts_file);
+      if(hts_fmt->format == sam) sf->format = SEQ_FMT_SAM;
+      else if(hts_fmt->format == bam) sf->format = SEQ_FMT_BAM;
+      else {
+        fprintf(stderr, "[%s:%i] Cannot identify hts file format\n",
+                __FILE__, __LINE__);
+        exit(EXIT_FAILURE);
+      }
     #else
       fprintf(stderr, "[%s:%i] Error: not compiled with sam/bam support\n",
               __FILE__, __LINE__);
@@ -482,14 +509,13 @@ static inline seq_file_t* seq_open2(const char *p, char sam_bam,
   {
     if(( use_zlib && ((sf->gz_file = gzopen(p, "r")) == NULL)) ||
        (!use_zlib && ((sf->f_file  =  fopen(p, "r")) == NULL))) {
-      free(sf);
+      seq_close(sf);
       return NULL;
     }
 
     if(!_seq_setup(sf, use_zlib, buf_size)) return NULL;
   }
 
-  sf->path = strdup(p);
   return sf;
 }
 
@@ -497,25 +523,30 @@ static inline seq_file_t* seq_open2(const char *p, char sam_bam,
 // so you shouldn't call fclose(fh)
 // Returns NULL on error, in which case FILE will not have been closed (caller
 // should then call fclose(fh))
-static inline seq_file_t* seq_open_fh(FILE *fh, char sam_bam,
-                                      char use_zlib, size_t buf_size)
+static inline seq_file_t* seq_dopen(int fd, char issam,
+                                    bool use_zlib, size_t buf_size)
 {
   seq_file_t *sf = calloc(1, sizeof(seq_file_t));
+  sf->path = strdup("-");
 
-  if(sam_bam)
+  if(issam)
   {
-    if(sam_bam != 1 && sam_bam != 2) {
-      fprintf(stderr, "[%s:%i] Error: sum_bam param must be 0, 1 (sam) or 2 (bam)\n",
-              __FILE__, __LINE__);
-      exit(EXIT_FAILURE);
-    }
     #ifdef _USESAM
-      if((sf->s_file = sam_open("-", sam_bam == 1 ? "rs" : "rb")) == NULL) {
-        free(sf);
+      if((sf->hts_file = hts_hopen(hdopen(fd, "r"), sf->path, "r")) == NULL) {
+        seq_close(sf);
         return NULL;
       }
-      sf->bam_header = sam_hdr_read(sf->s_file);
+      sf->bam_hdr = sam_hdr_read(sf->hts_file);
       sf->readfunc = sf->origreadfunc = _seq_read_sam;
+
+      const htsFormat *hts_fmt = hts_get_format(sf->hts_file);
+      if(hts_fmt->format == sam) sf->format = SEQ_FMT_SAM;
+      else if(hts_fmt->format == sam) sf->format = SEQ_FMT_BAM;
+      else {
+        fprintf(stderr, "[%s:%i] Cannot identify hts file format\n",
+                __FILE__, __LINE__);
+        exit(EXIT_FAILURE);
+      }
     #else
       fprintf(stderr, "[%s:%i] Error: not compiled with sam/bam support\n",
               __FILE__, __LINE__);
@@ -524,29 +555,26 @@ static inline seq_file_t* seq_open_fh(FILE *fh, char sam_bam,
   }
   else
   {
-    if(!use_zlib) sf->f_file = fh;
-    else if((sf->gz_file = gzdopen(fileno(fh), "r")) == NULL) {
-      free(sf);
+    if((!use_zlib && (sf->f_file  = fdopen(fd,  "r")) == NULL) ||
+       ( use_zlib && (sf->gz_file = gzdopen(fd, "r")) == NULL)) {
+      seq_close(sf);
       return NULL;
     }
 
     if(!_seq_setup(sf, use_zlib, buf_size)) return NULL;
   }
 
-  sf->path = strdup("-");
   return sf;
 }
 
 static inline seq_file_t* seq_open(const char *p)
 {
   assert(p != NULL);
-  if(strcmp(p,"-") == 0) return seq_open_fh(stdin, 0, 1, 0);
+  if(strcmp(p,"-") == 0) return seq_dopen(fileno(stdin), 0, 1, 0);
 
   seq_format format = seq_guess_filetype_from_extension(p);
-  char sam_bam = 0;
-  if(format == SEQ_FMT_SAM) sam_bam = 1;
-  if(format == SEQ_FMT_BAM) sam_bam = 2;
-  return seq_open2(p, sam_bam, 1, DEFAULT_BUFSIZE);
+  bool issam = (format == SEQ_FMT_SAM || format == SEQ_FMT_BAM);
+  return seq_open2(p, issam, 1, DEFAULT_BUFSIZE);
 }
 
 /*
@@ -570,14 +598,21 @@ static inline int seq_seek_start(seq_file_t *sf)
 // Close file handles, free resources
 static inline void seq_close(seq_file_t *sf)
 {
-  if(sf->f_file != NULL) { fclose(sf->f_file); sf->f_file = NULL; }
-  if(sf->gz_file != NULL) { gzclose(sf->gz_file); sf->gz_file = NULL; }
+  int e;
+  if(sf->f_file != NULL && (e = fclose(sf->f_file)) != 0) {
+    fprintf(stderr, "[%s:%i] Error closing file: %s [%i]\n", __FILE__, __LINE__,
+                    sf->path, e);
+  }
+  if(sf->gz_file != NULL && (e = gzclose(sf->gz_file)) != Z_OK) {
+    fprintf(stderr, "[%s:%i] Error closing gzfile: %s [%i]\n", __FILE__, __LINE__,
+                    sf->path, e);
+  }
   #ifdef _USESAM
-  if(sf->s_file != NULL) { sam_close(sf->s_file); sf->s_file = NULL; }
-  if(sf->bam_header != NULL) { free(sf->bam_header); sf->bam_header = NULL; }
+    if(sf->hts_file != NULL)  hts_close(sf->hts_file);
+    bam_hdr_destroy(sf->bam_hdr);
   #endif
   strm_buf_dealloc(&sf->in);
-  free(sf->path); sf->path = NULL;
+  free(sf->path);
   read_t *r = sf->rhead, *tmpr;
   while(r != NULL) { tmpr = r->next; seq_read_free(r); r = tmpr; }
   memset(sf, 0, sizeof(*sf));
@@ -689,7 +724,7 @@ static inline void _seq_read_force_qual_seq_lmatch(read_t *r)
 {
   size_t i;
   if(r->qual.end < r->seq.end) {
-    strm_buf_ensure_capacity(&(r->qual), r->seq.end);
+    cbuf_capacity(&r->qual.b, &r->qual.end, r->seq.end);
     for(i = r->qual.end; i < r->seq.end; i++) r->qual.b[i] = '.';
   }
   r->qual.b[r->qual.end = r->seq.end] = '\0';
@@ -873,8 +908,8 @@ _seq_print_fastq(seq_gzprint_fastq,gzFile,gzputs2,gzputc2)
 // seq_read_free(read_t* r)
 
 // seq_open(path)
-// seq_open2(path,sam_bam,use_gzip,buffer_size)
-// seq_open_fh(fh,use_gzip,buffer_size)
+// seq_open2(path,issam,use_gzip,buffer_size)
+// seq_dopen(fileno(fh),use_gzip,buffer_size)
 // seq_close(seq_file_t *sf)
 
 #endif
